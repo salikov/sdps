@@ -1,16 +1,14 @@
 # !pip install -q -U transformers diffusers accelerate gradio
 # !pip install -q Cython
 # !pip install -q insightface onnxruntime --no-build-isolation || (pip install -q "numpy<2" && pip install -q insightface onnxruntime --no-build-isolation)
-# !pip install -q -U kaggle   # === ИЗМЕНЕНО: образ Kaggle несёт старый CLI 2.0.2, который тихо падает на больших заливках ===
 
 import warnings, logging, os, gc, re, sys, math, glob, inspect, shutil, zipfile, traceback, subprocess, threading, time
-import json, importlib.util
 import torch, gradio as gr, urllib.request
 import numpy as np, cv2
 from PIL import Image, ImageOps
 from diffusers import (StableDiffusionXLPipeline, ControlNetModel,
                        DPMSolverMultistepScheduler, EulerDiscreteScheduler, EulerAncestralDiscreteScheduler)
-from huggingface_hub import hf_hub_download, list_repo_files, snapshot_download
+from huggingface_hub import hf_hub_download, list_repo_files
 
 warnings.filterwarnings("ignore")
 logging.getLogger("diffusers").setLevel(logging.ERROR)
@@ -64,150 +62,6 @@ def _p(prog, frac, desc):
         try: prog(frac, desc=desc)
         except Exception: pass
 
-# ---------- 0.5. Кеш тяжелых файлов в личном Kaggle-датасете ----------
-# Приоритет: 1) датасет-кеш подключён как Input (мгновенно) → 2) уже собран
-# в этой сессии → 3) скачивание кеш-датасета через Kaggle API (мимо HF) →
-# 4) обычная загрузка с HF + (один раз) сборка своего кеш-датасета.
-# Работает только на Kaggle и только при наличии секрета KAGGLE_API.
-KAGGLE_CACHE_SLUG = "sd-photostudio-cache"
-KAGGLE_CACHE_INPUT = f"/kaggle/input/{KAGGLE_CACHE_SLUG}"
-KAGGLE_CACHE_LOCAL = "/kaggle/tmp/sd_cache" if ENV == "kaggle" else os.path.join(WORK, "sd_cache")
-CACHE_MARKER = "base/model.safetensors"   # главный признак валидности кеша
-
-_cache = {"mode": None, "root": None, "upload": False, "dataset_id": None}
-
-def _run_kaggle(*args, timeout=1800):
-    try:
-        r = subprocess.run(["kaggle"] + list(args), capture_output=True, text=True, timeout=timeout)
-        return r.returncode == 0, (r.stdout or "") + (r.stderr or "")
-    except FileNotFoundError:
-        return False, "kaggle CLI не найден"
-    except subprocess.TimeoutExpired:
-        return False, "таймаут команды kaggle"
-
-def _kaggle_username():
-    """Секрет KAGGLE_API (JSON {"username":...,"key":...}) -> настройка CLI + username."""
-    if importlib.util.find_spec("kaggle") is None:
-        return None
-    try:
-        from kaggle_secrets import UserSecretsClient
-        raw = UserSecretsClient().get_secret("KAGGLE_API")
-    except Exception:
-        return None
-    raw = (raw or "").strip()
-    if not raw:
-        return None
-    try:
-        creds = json.loads(raw)
-        username, key = creds["username"], creds["key"]
-    except Exception:
-        print("⚠️ Секрет KAGGLE_API не похож на {\"username\":...,\"key\":...} — игнорируем.")
-        return None
-    kdir = os.path.join(os.path.expanduser("~"), ".kaggle")
-    os.makedirs(kdir, exist_ok=True)
-    kjson = os.path.join(kdir, "kaggle.json")
-    with open(kjson, "w") as f:
-        json.dump({"username": username, "key": key}, f)
-    os.chmod(kjson, 0o600)
-    return username
-
-def _init_cache():
-    # 1) датасет-кеш подключён как Input — идеально, ничего качать не надо
-    if os.path.isfile(os.path.join(KAGGLE_CACHE_INPUT, CACHE_MARKER)):
-        _cache.update(mode="input", root=KAGGLE_CACHE_INPUT, upload=False)
-        print("✅ Кеш-датасет подключён как Input — все модели уже на диске, качать нечего")
-        return
-    # 2) кеш уже собран в этой сессии (перезапуск ячейки)
-    if os.path.isfile(os.path.join(KAGGLE_CACHE_LOCAL, CACHE_MARKER)):
-        _cache.update(mode="local", root=KAGGLE_CACHE_LOCAL, upload=False)
-        username = _kaggle_username()
-        if username:
-            _cache["dataset_id"] = f"{username}/{KAGGLE_CACHE_SLUG}"
-            ok, _ = _run_kaggle("datasets", "files", _cache["dataset_id"], timeout=60)
-            if not ok:
-                _cache["upload"] = True   # файлы собрали, а датасет создать не успели
-        print("✅ Кеш уже на месте в этой сессии" + (" (датасет создадим в конце)" if _cache["upload"] else ""))
-        return
-    # 3) есть секрет KAGGLE_API?
-    username = _kaggle_username()
-    if not username:
-        _cache.update(mode="none", root=None, upload=False)
-        print("ℹ️ Секрета KAGGLE_API нет — кеш не используется, обычная загрузка моделей.")
-        return
-    dataset_id = f"{username}/{KAGGLE_CACHE_SLUG}"
-    _cache["dataset_id"] = dataset_id
-    ok, _ = _run_kaggle("datasets", "files", dataset_id, timeout=60)
-    if ok:
-        # 3а) датасет существует — скачиваем его (мимо Hugging Face)
-        print(f"📦 Кеш-датасет {dataset_id} существует — скачиваем его (мимо Hugging Face)...")
-        os.makedirs(KAGGLE_CACHE_LOCAL, exist_ok=True)
-        ok2, out2 = _run_kaggle("datasets", "download", dataset_id,
-                                "-p", KAGGLE_CACHE_LOCAL, "--unzip", timeout=3600)
-        for z in glob.glob(os.path.join(KAGGLE_CACHE_LOCAL, "*.zip")):
-            try: os.remove(z)
-            except OSError: pass
-        if ok2 and os.path.isfile(os.path.join(KAGGLE_CACHE_LOCAL, CACHE_MARKER)):
-            _cache.update(mode="kaggle", root=KAGGLE_CACHE_LOCAL, upload=False)
-            print("✅ Кеш скачан с Kaggle — тяжёлые модели грузятся без Hugging Face.")
-        else:
-            _cache.update(mode="none", root=None, upload=False)
-            print(f"⚠️ Кеш не скачался ({out2[:200]}) — грузим модели обычным путём.")
-        return
-    # 3б) датасета нет: модели качаем как обычно, в конце соберём кеш-датасет
-    _cache.update(mode="none", root=KAGGLE_CACHE_LOCAL, upload=True)
-    print("ℹ️ Кеш-датасета ещё нет: модели скачаем как обычно и один раз соберём кеш.")
-
-_init_cache()
-
-def _cache_path(rel):
-    return os.path.join(_cache["root"], rel) if _cache["root"] else None
-
-def _cache_writable():
-    return _cache["mode"] in ("local", "kaggle", "none") and _cache["root"] is not None
-
-def cached_hf_file(rel, repo_id, filename):
-    """Одиночный файл с HF: из кеша, иначе скачать и (если кеш пишется) положить в него."""
-    p = _cache_path(rel)
-    if p and os.path.isfile(p):
-        return p
-    src = hf_hub_download(repo_id, filename, token=hf_token)
-    if p and _cache_writable():
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        shutil.copy2(src, p)
-        return p
-    return src
-
-def cached_repo_dir(rel, repo_id, allow_patterns, marker, weights=(), ignore_patterns=None):
-    """Папка с файлами HF-репозитория (для from_pretrained): из кеша или snapshot в кеш."""
-    def _complete(d):
-        if not os.path.isfile(os.path.join(d, marker)):
-            return False
-        if weights and not any(os.path.isfile(os.path.join(d, w)) for w in weights):
-            return False
-        return True
-    p = _cache_path(rel)
-    if p and _complete(p):
-        return p
-    if p and _cache_writable():
-        try:
-            os.makedirs(p, exist_ok=True)
-            snapshot_download(repo_id, allow_patterns=allow_patterns,
-                              ignore_patterns=ignore_patterns, local_dir=p, token=hf_token)
-            # старые версии huggingface_hub кладут симлинки — заменяем на реальные файлы
-            for root_dir, _, files in os.walk(p):
-                for fn in files:
-                    fp = os.path.join(root_dir, fn)
-                    if os.path.islink(fp):
-                        real = os.path.realpath(fp)
-                        os.remove(fp)
-                        shutil.copy2(real, fp)
-            shutil.rmtree(os.path.join(p, ".cache"), ignore_errors=True)
-            if _complete(p):
-                return p
-        except Exception:
-            pass
-    return None   # кеш недоступен — вызывающий код грузит как раньше
-
 # ---------- 1. Базовая модель ----------
 BASE_MODEL = "realvis"   # "realvis" = RealVisXL V5.0 (фотореализм) | "sdxl" = SDXL base 1.0
 REALVIS_REPO = "SG161222/RealVisXL_V5.0"
@@ -217,14 +71,14 @@ SDXL_CONFIG = "stabilityai/stable-diffusion-xl-base-1.0"
 print("⏳ Загрузка базовой модели...")
 if BASE_MODEL == "realvis":
     try:
-        ckpt = cached_hf_file("base/model.safetensors", REALVIS_REPO, REALVIS_FILE)
+        ckpt = hf_hub_download(REALVIS_REPO, REALVIS_FILE, token=hf_token)
     except Exception:
         files = [f for f in list_repo_files(REALVIS_REPO, token=hf_token)
                  if f.lower().endswith(".safetensors")
                  and "vae" not in f.lower().replace("novae", "")   # исключаем VAE-файлы и вариант -Novae
                  and "inpaint" not in f.lower()]
         files.sort(key=lambda f: 0 if "fp16" in f.lower() else 1)
-        ckpt = cached_hf_file("base/model.safetensors", REALVIS_REPO, files[0])
+        ckpt = hf_hub_download(REALVIS_REPO, files[0], token=hf_token)
     try:
         pipe_base = StableDiffusionXLPipeline.from_single_file(ckpt, config=SDXL_CONFIG, torch_dtype=torch.float16, token=hf_token)
     except TypeError:
@@ -249,26 +103,6 @@ def _load_safety():
         return
     from transformers import CLIPImageProcessor
     from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
-
-    # 1) из кеша (Input / скачанный / собранный в этой сессии)
-    sdir = cached_repo_dir("safety", "stable-diffusion-v1-5/stable-diffusion-v1-5",
-                           ["feature_extractor/*", "safety_checker/*"],
-                           marker="safety_checker/config.json",
-                           weights=("safety_checker/model.safetensors",
-                                    "safety_checker/model.bin"),
-                           ignore_patterns=["*.bin", "*.msgpack", "*.flax", "*.h5"])
-    if sdir:
-        try:
-            _safety_processor = CLIPImageProcessor.from_pretrained(os.path.join(sdir, "feature_extractor"))
-            _safety_checker = StableDiffusionSafetyChecker.from_pretrained(os.path.join(sdir, "safety_checker"))
-            _safety_checker.to("cpu").eval()
-            print("✅ NSFW-фильтр включён (из кеша)")
-            return
-        except Exception:
-            traceback.print_exc()
-            _safety_processor, _safety_checker = None, None
-
-    # 2) обычная загрузка с HF (как раньше)
     last = None
     for repo in ("stable-diffusion-v1-5/stable-diffusion-v1-5", "runwayml/stable-diffusion-v1-5"):
         try:
@@ -382,13 +216,6 @@ def _ensure_antelopev2(progress=None):
     from insightface.app import FaceAnalysis
     model_dir = os.path.join(IFR_ROOT, "models", "antelopev2")
     os.makedirs(model_dir, exist_ok=True)
-
-    # --- Kaggle-кеш: если onnx уже есть в кеше — просто копируем на место ---
-    cdir = _cache_path("insightface/antelopev2")
-    if cdir:
-        for f in glob.glob(os.path.join(cdir, "*.onnx")):
-            shutil.copy(f, os.path.join(model_dir, os.path.basename(f)))
-
     def _top():
         return sorted(glob.glob(os.path.join(model_dir, "*.onnx")))
     onnx_files = _top()
@@ -417,16 +244,6 @@ def _ensure_antelopev2(progress=None):
         else:
             raise RuntimeError(f"Не удалось скачать antelopev2: {last_err}")
         onnx_files = _top()
-
-    # --- если собираем кеш-датасет — сохраняем onnx для будущей заливки ---
-    if _cache["upload"] and onnx_files:
-        cdir = _cache_path("insightface/antelopev2")
-        os.makedirs(cdir, exist_ok=True)
-        for f in onnx_files:
-            dst = os.path.join(cdir, os.path.basename(f))
-            if not os.path.exists(dst):
-                shutil.copy(f, dst)
-
     listing = ", ".join(f"{os.path.basename(f)} ({os.path.getsize(f)//(1024*1024)} МБ)" for f in onnx_files)
     print("📦 Модели InsightFace:", listing)
     try:
@@ -470,25 +287,14 @@ def ensure_instantid(progress=None):
     PipelineClass = _load_instantid_class()
     ensure_face_app(progress)
     _p(progress, 0.3, "Загрузка ControlNet InstantID (~2.5 ГБ)...")
-    # --- Kaggle-кеш: ControlNet из локальной папки, иначе как раньше с HF ---
-    cn_dir = cached_repo_dir("instantid", INSTANTID_HF_REPO, ["ControlNetModel/*"],
-                             marker="ControlNetModel/config.json",
-                             weights=("ControlNetModel/diffusion_pytorch_model.safetensors",
-                                      "ControlNetModel/diffusion_pytorch_model.bin"),
-                             ignore_patterns=["*.bin", "*.msgpack", "*.flax", "*.h5"])
-    if cn_dir:
-        controlnet = ControlNetModel.from_pretrained(os.path.join(cn_dir, "ControlNetModel"),
-                                                     torch_dtype=torch.float16)
-    else:
-        controlnet = ControlNetModel.from_pretrained(INSTANTID_HF_REPO, subfolder="ControlNetModel",
-                                                     torch_dtype=torch.float16, token=hf_token)
+    controlnet = ControlNetModel.from_pretrained(INSTANTID_HF_REPO, subfolder="ControlNetModel",
+                                                 torch_dtype=torch.float16, token=hf_token)
     _p(progress, 0.5, "Сборка пайплайна (компоненты базовой модели переиспользуются)...")
     allowed = set(inspect.signature(PipelineClass.__init__).parameters) - {"self"}
     comps = {k: v for k, v in dict(pipe_base.components).items() if k in allowed}
     pipe_instant = PipelineClass(controlnet=controlnet, **comps)
     _p(progress, 0.7, "Загрузка IP-Adapter InstantID (~1.7 ГБ)...")
-    # --- Kaggle-кеш: IP-Adapter как одиночный файл ---
-    adapter_path = cached_hf_file("instantid/ip-adapter.bin", INSTANTID_HF_REPO, "ip-adapter.bin")
+    adapter_path = hf_hub_download(INSTANTID_HF_REPO, "ip-adapter.bin", token=hf_token)
     _load_instantid_adapter(pipe_instant, adapter_path)
     # ФИКС: community-файл вызывает check_inputs с устаревшим порядком аргументов ->
     # ложная ошибка "controlnet_conditioning_scale must be float". Отключаем валидацию.
@@ -510,79 +316,6 @@ try:
 except Exception:
     traceback.print_exc()
     print("⚠️ InstantID не собрался при старте — попытка повторится при первом использовании режима.")
-
-# ---------- 3.5. Сборка кеш-датасета Kaggle (один раз) ----------
-# === ИЗМЕНЕНО: честная проверка после заливки (datasets files + ожидание),
-# при ошибке печатается реальный вывод CLI, а не молчаливый успех ===
-def _dataset_exists(dataset_id):
-    ok, _ = _run_kaggle("datasets", "files", dataset_id, timeout=60)
-    return ok
-
-def _maybe_create_cache_dataset():
-    if not _cache["upload"] or not _cache["dataset_id"]:
-        return
-    root = _cache["root"]
-    if not root or not os.path.isdir(root):
-        return
-
-    def _any(*rels):
-        return any(os.path.isfile(os.path.join(root, r)) for r in rels)
-
-    missing = []
-    if not _any("base/model.safetensors"):
-        missing.append("базовая модель")
-    if not _any("instantid/ControlNetModel/diffusion_pytorch_model.safetensors",
-                "instantid/ControlNetModel/diffusion_pytorch_model.bin"):
-        missing.append("ControlNet InstantID")
-    if not _any("instantid/ip-adapter.bin"):
-        missing.append("IP-Adapter InstantID")
-    if not _any("safety/safety_checker/model.safetensors",
-                "safety/safety_checker/model.bin"):
-        missing.append("NSFW-фильтр")
-    if len(glob.glob(os.path.join(root, "insightface/antelopev2/*.onnx"))) < 3:
-        missing.append("InsightFace (antelopev2)")
-    if missing:
-        print(f"⚠️ Кеш неполный ({', '.join(missing)}) — датасет не создаём. "
-              "Перезапустите ноутбук, чтобы попробовать снова.")
-        return
-
-    gb = sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fs in os.walk(root) for f in fs) / 2**30
-    print(f"⏳ Создаём кеш-датасет {_cache['dataset_id']} (~{gb:.1f} ГБ, займёт 10–25 минут)...")
-    with open(os.path.join(root, "dataset-metadata.json"), "w") as f:
-        json.dump({"title": KAGGLE_CACHE_SLUG, "id": _cache["dataset_id"],
-                   "licenses": [{"name": "CC0-1.0"}]}, f, indent=2)
-
-    ok, out = _run_kaggle("datasets", "create", "-p", root, "--dir-mode", "zip", timeout=7200)
-  
-    if not ok:
-        print("⚠️ kaggle datasets create вернул ошибку. Последние строки вывода:")
-        print((out or "")[-800:])
-        if "already exist" not in (out or "").lower():
-            print("   Генерации это не ломает — при следующем запуске попытка повторится.")
-            return
-        print("   (похоже, датасет с таким slug уже существует — проверяем...)")
-
-    # честная финальная проверка: датасет должен отвечать на 'datasets files'
-    found = _dataset_exists(_cache["dataset_id"])
-    attempt = 0
-    while not found and attempt < 5:
-        attempt += 1
-        print(f"   Датасет ещё не виден, ждём 30 с (попытка {attempt}/5)...")
-        time.sleep(30)
-        found = _dataset_exists(_cache["dataset_id"])
-
-    if found:
-        print(f"🎉 Кеш-датасет подтверждён: https://www.kaggle.com/datasets/{_cache['dataset_id']}")
-        print("   Подключите его как Input (Input → Add Input → Your Work + Datasets) и перезапустите сессию.")
-        print("   ⚠️ В поиске Add Input свежий датасет может появиться не сразу — иногда до часа.")
-    else:
-        print("❌ Датасет не подтверждается через kaggle datasets files.")
-        print("   Возможно, ещё обрабатывается — проверьте через пару минут вручную:")
-        print(f"   kaggle datasets files {_cache['dataset_id']}")
-        print("   Либо посмотрите в профиле kaggle.com/<логин> → Datasets.")
-        print("   На генерацию не влияет: при следующем запуске кеш попробует создаться снова.")
-
-_maybe_create_cache_dataset()
 
 def detect_face(pil_image):
     img = ImageOps.exif_transpose(pil_image).convert("RGB")
