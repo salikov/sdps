@@ -523,3 +523,6 @@ with gr.Blocks() as app:
     )
 
 app.launch(share=True, debug=True)
+
+if os.path.exists("vtt.py"):
+    os.remove("vtt.py")
