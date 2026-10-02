@@ -434,7 +434,6 @@ def generate(prompt, negative_prompt, steps, cfg, seed, width, height, sampler, 
 # ---------- 5. ИНТЕРФЕЙС ----------
 with gr.Blocks(theme=gr.themes.Soft(), css=custom_css) as demo:
     gr.Markdown("# 🎨 AI Studio: фотореалистичная генерация + Персонаж с фото")
-    gr.Markdown("🛡️ NSFW-фильтр включён принудительно: помеченные кадры заменяются чёрными.")
     with gr.Row():
         with gr.Column(scale=1):
             prompt_in = gr.Textbox(label="Prompt",
@@ -442,7 +441,6 @@ with gr.Blocks(theme=gr.themes.Soft(), css=custom_css) as demo:
             neg_in = gr.Textbox(label="Negative Prompt",
                 value="deformed, distorted, disfigured, poorly drawn, bad anatomy, wrong anatomy, extra limb, missing limb, floating limbs, mutated hands and fingers, disconnected limbs, blurry, jpeg artifacts, worst quality, low quality, watermark, text, signature")
             with gr.Accordion("👤 Персонаж с фото (InstantID)", open=False):
-                gr.Markdown("Модели уже загружены при старте — просто включите, загрузите портрет и пишите промпт.")
                 use_face_cb = gr.Checkbox(label="Использовать персонажа с фото", value=False)
                 face_img = gr.Image(label="Фото лица (лучше анфас, лицо крупно, без очков)", type="pil", height=300)
                 with gr.Row():
