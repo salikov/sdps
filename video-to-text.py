@@ -5,14 +5,16 @@
 # deno ставим напрямую с GitHub — официальный install.sh теперь
 # задаёт интерактивный вопрос про PATH и виснет в Kaggle (нет stdin).
 # Бинарник кладём в /usr/local/bin — этот путь уже есть в PATH.
-!curl -fsSL -o /tmp/deno.zip https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip
+import os
+os.system("curl -fsSL -o /tmp/deno.zip https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip")
 
-import zipfile, os
+
+import zipfile
 with zipfile.ZipFile("/tmp/deno.zip") as z:
     z.extractall("/usr/local/bin")
 os.chmod("/usr/local/bin/deno", 0o755)
 
-!deno --version
+os.system("deno --version")
 print("УСПЕШНО: Библиотеки и deno установлены!")
 
 # ================================================================
