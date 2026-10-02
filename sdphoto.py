@@ -1,6 +1,7 @@
-#!pip install -q -U transformers diffusers accelerate gradio
-#!pip install -q Cython
-#!pip install -q insightface onnxruntime --no-build-isolation || (pip install -q "numpy<2" && pip install -q insightface onnxruntime --no-build-isolation)
+# !pip install -q -U transformers diffusers accelerate gradio
+# !pip install -q Cython
+# !pip install -q insightface onnxruntime --no-build-isolation || (pip install -q "numpy<2" && pip install -q insightface onnxruntime --no-build-isolation)
+# !pip install -q -U kaggle   # === ИЗМЕНЕНО: образ Kaggle несёт старый CLI 2.0.2, который тихо падает на больших заливках ===
 
 import warnings, logging, os, gc, re, sys, math, glob, inspect, shutil, zipfile, traceback, subprocess, threading, time
 import json, importlib.util
@@ -111,7 +112,7 @@ def _kaggle_username():
     return username
 
 def _init_cache():
-    # 1) датасет-кеш подключён как Input — идеально, ничего качаем
+    # 1) датасет-кеш подключён как Input — идеально, ничего качать не надо
     if os.path.isfile(os.path.join(KAGGLE_CACHE_INPUT, CACHE_MARKER)):
         _cache.update(mode="input", root=KAGGLE_CACHE_INPUT, upload=False)
         print("✅ Кеш-датасет подключён как Input — все модели уже на диске, качать нечего")
@@ -511,6 +512,12 @@ except Exception:
     print("⚠️ InstantID не собрался при старте — попытка повторится при первом использовании режима.")
 
 # ---------- 3.5. Сборка кеш-датасета Kaggle (один раз) ----------
+# === ИЗМЕНЕНО: честная проверка после заливки (datasets files + ожидание),
+# при ошибке печатается реальный вывод CLI, а не молчаливый успех ===
+def _dataset_exists(dataset_id):
+    ok, _ = _run_kaggle("datasets", "files", dataset_id, timeout=60)
+    return ok
+
 def _maybe_create_cache_dataset():
     if not _cache["upload"] or not _cache["dataset_id"]:
         return
@@ -521,7 +528,6 @@ def _maybe_create_cache_dataset():
     def _any(*rels):
         return any(os.path.isfile(os.path.join(root, r)) for r in rels)
 
-    # датасет создаём только из ПОЛНОГО набора файлов
     missing = []
     if not _any("base/model.safetensors"):
         missing.append("базовая модель")
@@ -545,13 +551,36 @@ def _maybe_create_cache_dataset():
     with open(os.path.join(root, "dataset-metadata.json"), "w") as f:
         json.dump({"title": KAGGLE_CACHE_SLUG, "id": _cache["dataset_id"],
                    "licenses": [{"name": "CC0-1.0"}]}, f, indent=2)
-    ok, out = _run_kaggle("datasets", "create", "-p", root, timeout=7200)
-    if ok or "already exist" in (out or "").lower():
-        print(f"🎉 Кеш-датасет готов: https://www.kaggle.com/datasets/{_cache['dataset_id']}")
-        print("   Один раз подключите его как Input: Input → Add Input → Your Work + Datasets,")
-        print("   затем перезапустите сессию — модели будут готовы сразу, без скачивания.")
+
+    ok, out = _run_kaggle("datasets", "create", "-p", root, "--dir-mode", "zip", timeout=7200)
+  
+    if not ok:
+        print("⚠️ kaggle datasets create вернул ошибку. Последние строки вывода:")
+        print((out or "")[-800:])
+        if "already exist" not in (out or "").lower():
+            print("   Генерации это не ломает — при следующем запуске попытка повторится.")
+            return
+        print("   (похоже, датасет с таким slug уже существует — проверяем...)")
+
+    # честная финальная проверка: датасет должен отвечать на 'datasets files'
+    found = _dataset_exists(_cache["dataset_id"])
+    attempt = 0
+    while not found and attempt < 5:
+        attempt += 1
+        print(f"   Датасет ещё не виден, ждём 30 с (попытка {attempt}/5)...")
+        time.sleep(30)
+        found = _dataset_exists(_cache["dataset_id"])
+
+    if found:
+        print(f"🎉 Кеш-датасет подтверждён: https://www.kaggle.com/datasets/{_cache['dataset_id']}")
+        print("   Подключите его как Input (Input → Add Input → Your Work + Datasets) и перезапустите сессию.")
+        print("   ⚠️ В поиске Add Input свежий датасет может появиться не сразу — иногда до часа.")
     else:
-        print(f"⚠️ Датасет не создался: {out[:300]} — не страшно, генерация работает как обычно.")
+        print("❌ Датасет не подтверждается через kaggle datasets files.")
+        print("   Возможно, ещё обрабатывается — проверьте через пару минут вручную:")
+        print(f"   kaggle datasets files {_cache['dataset_id']}")
+        print("   Либо посмотрите в профиле kaggle.com/<логин> → Datasets.")
+        print("   На генерацию не влияет: при следующем запуске кеш попробует создаться снова.")
 
 _maybe_create_cache_dataset()
 
