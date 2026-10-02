@@ -1,3 +1,7 @@
+#!pip install -q -U transformers diffusers accelerate gradio
+#!pip install -q Cython
+#!pip install -q insightface onnxruntime --no-build-isolation || (pip install -q "numpy<2" && pip install -q insightface onnxruntime --no-build-isolation)
+
 import warnings, logging, os, gc, re, sys, math, glob, inspect, shutil, zipfile, traceback, subprocess, threading, time
 import torch, gradio as gr, urllib.request
 import numpy as np, cv2
