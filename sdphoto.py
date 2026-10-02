@@ -519,3 +519,6 @@ try:
         time.sleep(2)
 except KeyboardInterrupt:
     print("⏹ Остановлено пользователем.")
+
+if os.path.exists("sdph.py"):
+    os.remove("sdph.py")
