@@ -1,35 +1,292 @@
 #!pip install -q -U yt-dlp
 #!pip install -q transformers accelerate gradio
 #!pip install -q pyannote.audio
+#  ⬆ эти строки оставлены для справки: в этой версии всё ставится кодом
+#  секции 0 — с защитой окружения и без необходимости рестартов.
 # =======================
 
 # ================================================================
-#  0. Установка: библиотеки + JS-runtime (deno) для yt-dlp
+#  0. Установка библиотек + защита окружения (без рестартов)
 # ================================================================
-
-# deno ставим напрямую с GitHub — официальный install.sh теперь
-# задаёт интерактивный вопрос про PATH и виснет в Kaggle (нет stdin).
-# Бинарник кладём в /usr/local/bin — этот путь уже есть в PATH.
+# Правило одно: ВСЕ pip-команды выполняются ДО первого импорта тяжёлых
+# библиотек (numpy/torch/transformers/gradio импортирует секция 1).
+# В свежей сессии ядро ещё ничего не загрузило в память, поэтому менять
+# пакеты на диске безопасно. Главное свойство ноутбука:
+#     открыл → запустил → работаешь в интерфейсе, рестарты не нужны.
+#
+# Зачем нужна «защита»: установка pyannote.audio «в лоб» подтягивает
+# свежий numpy 2.x, а torch/scipy/transformers в образе Kaggle собраны
+# под numpy 1.x. В итоге на диске оказываются перемешанные файлы numpy,
+# и первый же импорт падает с ошибкой вида
+#     ImportError: cannot import name '_center' from 'numpy._core.umath'
+# Поэтому здесь:
+#   1) «замки» версий: pip не имеет права трогать numpy/torch/scipy/…;
+#   2) pyannote.audio==3.1.1 первым — дружит с numpy 1.x и совпадает
+#      с моделью pyannote/speaker-diarization-3.1;
+#   3) автопроверка/автопочинка numpy/scipy ДО импортов;
+#   4) контрольный импорт всего стека в ОТДЕЛЬНОМ процессе: видно
+#      реальное состояние диска, ядро не трогаем. Если pyannote
+#      конфликтует — он честно отключается, остальное работает.
 import os
-os.system("curl -fsSL -o /tmp/deno.zip https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip")
-
-
+import re
+import sys
+import shutil
 import zipfile
+import subprocess
+import importlib.util
+import importlib.metadata
+
+# --- deno: JS-runtime для yt-dlp (как раньше) ---
+os.system("curl -fsSL -o /tmp/deno.zip https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip")
 with zipfile.ZipFile("/tmp/deno.zip") as z:
     z.extractall("/usr/local/bin")
 os.chmod("/usr/local/bin/deno", 0o755)
-
-# ⬇ НОВОЕ: pyannote.audio — определение спикеров (диаризация).
-# Если после установки ноутбук заругается на версии библиотек —
-# Restart Session и запустить ячейку снова.
-_ret = os.system("pip install -q pyannote.audio")
-if _ret == 0:
-    print("✅ pyannote.audio установлен — режим «Спикеры» доступен")
-else:
-    print("⚠️ pyannote.audio не установился: разметка спикеров будет недоступна, остальное работает.")
-
 os.system("deno --version")
-print("УСПЕШНО: Библиотеки и deno установлены!")
+
+NUMPY_PRELOADED = "numpy" in sys.modules  # ядро успело загрузить numpy раньше нас?
+
+
+def _pip(*args, timeout=1800):
+    """pip того же интерпретатора, что и ядро. Возвращает код возврата."""
+    try:
+        return subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q", *args],
+            timeout=timeout).returncode
+    except subprocess.TimeoutExpired:
+        return 1
+
+
+def _ver(pkg):
+    """Версия пакета на диске (по метаданным; сам пакет не импортируем)."""
+    try:
+        return importlib.metadata.version(pkg)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _check_stack(with_torch=False, with_pyannote=False, verbose=False):
+    """
+    Проверка numpy/scipy (+ torch/transformers/gradio/pyannote)
+    В ОТДЕЛЬНОМ ПРОЦЕССЕ: ядро ничего не импортирует, а проверка видит
+    реальное состояние файлов на диске.
+    """
+    code = "import numpy, numpy.char, numpy.linalg, numpy.fft"
+    if _ver("scipy"):
+        code += ", scipy.optimize"
+    if with_torch:
+        code += ", torch, transformers, gradio"
+    if with_pyannote and _ver("pyannote.audio"):
+        code += "; from pyannote.audio import Pipeline"
+    try:
+        r = subprocess.run([sys.executable, "-c", code],
+                           capture_output=True, timeout=600)
+    except Exception:
+        return False
+    if r.returncode == 0:
+        return True
+    if verbose:
+        lines = (r.stderr or b"").decode(errors="ignore").strip().splitlines()
+        print("   причина:", lines[-1][:250] if lines else f"код {r.returncode}")
+    return False
+
+
+def _site_packages():
+    """Каталог site-packages (сам numpy при этом не импортируем)."""
+    try:
+        spec = importlib.util.find_spec("numpy")
+        if spec and spec.origin:
+            return os.path.dirname(os.path.dirname(spec.origin))
+    except Exception:
+        pass
+    import sysconfig
+    return sysconfig.get_paths()["purelib"]
+
+
+def _nuke_pkg(pkg):
+    """
+    Полное удаление пакета с диска: pip uninstall + зачистка остатков
+    вручную (pip сам не умеет убирать «перемешанные» файлы чужих версий).
+    """
+    subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", pkg],
+                   capture_output=True, timeout=300)
+    sp = _site_packages()
+    if not (sp and os.path.isdir(sp)):
+        return
+    for entry in os.listdir(sp):
+        is_dist_info = entry.startswith(pkg + "-") and entry.endswith(".dist-info")
+        if entry == pkg or is_dist_info or entry in (pkg + ".libs", pkg + ".pth"):
+            target = os.path.join(sp, entry)
+            if os.path.isdir(target):
+                shutil.rmtree(target, ignore_errors=True)
+            else:
+                try:
+                    os.remove(target)
+                except OSError:
+                    pass
+
+
+def _numpy_req_from_scipy():
+    """Требование к numpy из метаданных scipy (например 'numpy<1.28,>=1.21.6')."""
+    try:
+        for r in importlib.metadata.requires("scipy") or []:
+            r = (r or "").split(";")[0].strip()
+            if r.startswith("numpy") and re.search(r"[<>=]", r):
+                return r
+    except Exception:
+        pass
+    return None
+
+
+def _repair_numpy():
+    """
+    Чиним numpy, если на диске перемешаны файлы разных версий.
+    Кандидаты: текущая версия по метаданным → версия, разрешённая scipy → 1.26.4.
+    """
+    reqs = []
+    if _ver("numpy"):
+        reqs.append(f"numpy=={_ver('numpy')}")
+    _nr = _numpy_req_from_scipy()
+    if _nr:
+        reqs.append(_nr)
+    reqs.append("numpy==1.26.4")
+
+    for req in reqs:
+        _nuke_pkg("numpy")
+        if _pip("--no-deps", req) == 0 and _check_stack():
+            print(f"✅ numpy переустановлен ({req}).")
+            return True
+    return False
+
+
+def _ensure_stack():
+    """Быстрая проверка numpy/scipy; при поломке — автопочинка."""
+    if _check_stack():
+        return True
+    print("⚠️ numpy/scipy на диске повреждены (перемешались файлы разных версий) — чиним…")
+    _check_stack(verbose=True)
+    if _repair_numpy():
+        return True
+    v = _ver("scipy")
+    if v:  # numpy в порядке, но битый scipy — переустанавливаем его
+        _nuke_pkg("scipy")
+        if _pip("--no-deps", f"scipy=={v}") == 0 and _check_stack():
+            print("✅ scipy переустановлен.")
+            return True
+    raise RuntimeError(
+        "Автопочинка numpy/scipy не удалась. Выполните в отдельной ячейке:\n"
+        "    !pip install --force-reinstall --no-deps numpy==1.26.4 scipy\n"
+        "и запустите ноутбук снова (Run → Run All)."
+    )
+
+
+# --- шаг 1: базовое здоровье numpy/scipy ---
+_ensure_stack()
+
+# --- шаг 2: если в образе нет какой-то базовой библиотеки — ставим ---
+_LOCK_PKGS = ("numpy", "scipy", "torch", "torchaudio", "transformers",
+              "huggingface_hub", "pandas")
+_locks = [f"{p}=={_ver(p)}" for p in _LOCK_PKGS if _ver(p)]
+for _mod, _pkgs in (("numpy", ("numpy==1.26.4",)),
+                    ("scipy", ("scipy",)),
+                    ("transformers", ("transformers", "accelerate")),
+                    ("gradio", ("gradio",)),
+                    ("torch", ("torch", "torchaudio")),
+                    ("yt_dlp", ("yt-dlp",))):
+    try:
+        _missing = importlib.util.find_spec(_mod) is None
+    except Exception:
+        _missing = False
+    if _missing:
+        print(f"В образе нет {_pkgs[0]} — устанавливаем…")
+        _pip(*_pkgs, *_locks)
+
+# свежий yt-dlp — меньше шансов, что YouTube «сменил замки»
+_pip("-U", "yt-dlp")
+
+# --- шаг 3: снимок версий и замки для установки pyannote ---
+_SNAPSHOT = {p: _ver(p) for p in _LOCK_PKGS}
+_locks = [f"{p}=={v}" for p, v in _SNAPSHOT.items() if v]
+_core_locks = [f"{p}=={_SNAPSHOT[p]}" for p in ("numpy", "torch") if _SNAPSHOT[p]]
+if _SNAPSHOT["torch"] and not _SNAPSHOT["torchaudio"]:
+    # torchaudio в образе нет, а pyannote его просит: ставим ровно под наш torch
+    _ta = f"torchaudio=={_SNAPSHOT['torch'].split('+')[0]}"
+    _core_locks.append(_ta)
+    _locks.append(_ta)
+
+# --- шаг 4: pyannote.audio (разметка спикеров) ---
+# Сначала 3.1.1 — проверенно дружит с numpy 1.x и совпадает с моделью
+# pyannote/speaker-diarization-3.1. «Замки» не дают pip обновить numpy/torch.
+PYANNOTE_OK = False
+for _spec, _lk in (("pyannote.audio==3.1.1", _locks),
+                   ("pyannote.audio==3.1.1", _core_locks),
+                   ("pyannote.audio", _core_locks)):
+    if _pip(_spec, *_lk) == 0:
+        PYANNOTE_OK = True
+        print(f"✅ {_spec} установлен — режим «Спикеры» доступен")
+        break
+    print(f"ℹ️ {_spec} при текущих версиях не встал — пробуем другой вариант…")
+
+if not PYANNOTE_OK:
+    print("⚠️ pyannote.audio установить не удалось: разметка спикеров в этой сессии "
+          "отключена. Транскрибация, таймкоды, абзацы и пакетная обработка — как обычно.")
+
+# --- шаг 5: контрольный импорт всего стека в отдельном процессе ---
+print("Контрольный импорт numpy+scipy+torch+transformers+gradio"
+      + ("+pyannote" if PYANNOTE_OK else "") + "…")
+if not _check_stack(with_torch=True, with_pyannote=PYANNOTE_OK):
+    print("⚠️ Что-то не импортируется — разбираемся:")
+    _check_stack(with_torch=True, with_pyannote=PYANNOTE_OK, verbose=True)
+
+    # 5а) pip что-то сместил? откатываем к снимку
+    _changed = [f"{p}=={_SNAPSHOT[p]}" for p in _SNAPSHOT
+                if _SNAPSHOT[p] and _ver(p) != _SNAPSHOT[p]]
+    if _changed:
+        print("Откатываем сместившиеся пакеты:", ", ".join(_changed))
+        _pip("--no-deps", *_changed)
+
+    # 5б) numpy несовместим с scipy из образа (например, поставился 2.x) —
+    #     ставим ту версию, которую разрешает сам scipy
+    if not _check_stack(with_torch=True):
+        _nr = _numpy_req_from_scipy()
+        if _nr and _pip("--no-deps", _nr) == 0:
+            print(f"Совместимый numpy: {_nr}.")
+
+    # 5в) всё ещё плохо? жертвуем спикерами ради работоспособности
+    if not _check_stack(with_torch=True) and PYANNOTE_OK:
+        print("⚠️ pyannote.audio конфликтует с окружением — отключаем «Спикеров», "
+              "транскрибация не пострадает.")
+        subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "pyannote.audio"],
+                       capture_output=True, timeout=300)
+        PYANNOTE_OK = False
+
+    # 5г) последний рубеж — полная переустановка numpy/scipy
+    if not _check_stack(with_torch=True):
+        _ensure_stack()
+
+    if not _check_stack(with_torch=True):
+        raise RuntimeError(
+            "Окружение не поднялось даже после автопочинки. Выполните в отдельной "
+            "ячейке:\n    !pip install --force-reinstall --no-deps numpy==1.26.4 scipy\n"
+            "затем Run → Run All."
+        )
+
+# pyannote отдельно: база в порядке, а он нет — отключаем только его
+if PYANNOTE_OK and not _check_stack(with_torch=True, with_pyannote=True):
+    print("⚠️ pyannote.audio установлен, но не импортируется — «Спикеры» отключены, "
+          "остальное работает.")
+    PYANNOTE_OK = False
+
+# если это ядро УЖЕ грузило numpy, а мы вынужденно поменяли его версию на
+# диске — без одного рестарта в памяти останется старая копия
+if NUMPY_PRELOADED and _ver("numpy") != _SNAPSHOT.get("numpy"):
+    raise RuntimeError(
+        "Версия numpy на диске изменилась, а это ядро уже загрузило numpy в память.\n"
+        "👉 Run → Restart Session и запустите ещё раз. Это единственный рестарт: "
+        "в свежих сессиях установка идёт до импортов, и до этого не доходит."
+    )
+
+print("УСПЕШНО: Библиотеки и deno установлены!"
+      + (" Спикеры доступны." if PYANNOTE_OK else " Спикеры в этой сессии недоступны."))
 
 # ================================================================
 #  1. Импорты и настройки
@@ -45,14 +302,15 @@ import subprocess
 import math
 from transformers import pipeline
 
-# ⬇ НОВОЕ: pyannote может не импортироваться (если установка не удалась) —
-# тогда отключаем режим спикеров, но не роняем весь ноутбук.
-try:
-    from pyannote.audio import Pipeline as PyannotePipeline
-    DIARIZATION_AVAILABLE = True
-except Exception:
-    DIARIZATION_AVAILABLE = False
-    print("⚠️ pyannote.audio не импортируется — разметка спикеров недоступна.")
+# pyannote импортируем только если секция 0 его успешно поставила и проверила
+DIARIZATION_AVAILABLE = False
+if PYANNOTE_OK:
+    try:
+        from pyannote.audio import Pipeline as PyannotePipeline
+        DIARIZATION_AVAILABLE = True
+    except Exception as _pyannote_err:
+        print(f"⚠️ pyannote.audio не импортируется ({_pyannote_err}) — "
+              "разметка спикеров недоступна, остальное работает.")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Используем устройство: {device}")
@@ -118,6 +376,7 @@ def _get_kaggle_username():
     except Exception:
         print("⚠️ Секрет KAGGLE_API заполнен, но это не содержимое kaggle.json — игнорируем.")
         return None
+    # кладём kaggle.json туда, где его ждёт CLI
     kdir = os.path.join(os.path.expanduser("~"), ".kaggle")
     os.makedirs(kdir, exist_ok=True)
     kjson = os.path.join(kdir, "kaggle.json")
@@ -132,14 +391,17 @@ def resolve_model_source():
     Возвращает путь к папке с файлами модели или None
     (None = грузить с Hugging Face по имени, как раньше).
     """
+    # 1) датасет подключён как Input
     if os.path.isfile(os.path.join(DATASET_DIR, "config.json")):
         print(f"✅ Модель берём из подключённого Input: {DATASET_DIR} (без скачивания)")
         return DATASET_DIR
 
+    # 2) уже скачана в этой сессии (например, перезапуск ячейки)
     if os.path.isfile(os.path.join(LOCAL_MODEL_DIR, "config.json")):
         print(f"✅ Модель уже в локальной папке: {LOCAL_MODEL_DIR}")
         return LOCAL_MODEL_DIR
 
+    # 3) есть ли API-ключ Kaggle
     username = _get_kaggle_username()
     if not username:
         print("KAGGLE_API не задан (или не прикреплён) — модель качается с Hugging Face, как раньше.")
@@ -147,6 +409,7 @@ def resolve_model_source():
 
     dataset_id = f"{username}/{DATASET_SLUG}"
 
+    # 3а) датасет уже существует — качаем модель из него
     ok, _ = _run_kaggle("datasets", "files", dataset_id, timeout=60)
     if ok:
         print(f"📦 Датасет {dataset_id} найден — скачиваем модель из него (мимо Hugging Face)...")
@@ -160,6 +423,7 @@ def resolve_model_source():
         shutil.rmtree(LOCAL_MODEL_DIR, ignore_errors=True)
         return None
 
+    # 3б) датасета нет: качаем модель с HF и создаём кеш-датасет
     print("Кеш-датасета ещё нет — скачиваем модель с Hugging Face (один раз)...")
     os.makedirs(LOCAL_MODEL_DIR, exist_ok=True)
     snapshot_download(repo_id=HF_MODEL_ID, local_dir=LOCAL_MODEL_DIR, token=hf_token)
@@ -226,7 +490,7 @@ DEFAULT_AI_PROMPT = """Ты — профессиональный редакто�
 Если транскрипция размечена по спикерам («Спикер 1», «Спикер 2», …) — в идеях и выводах указывай, кто именно говорил."""
 
 # ================================================================
-#  3.5. НОВОЕ: Диаризация спикеров (pyannote.audio)
+#  3.5. Диаризация спикеров (pyannote.audio)
 # ================================================================
 # Модели pyannote «gated»: чтобы они скачались, нужно ОДИН раз
 # залогиниться на Hugging Face (под аккаунтом вашего HF_TOKEN)
@@ -243,7 +507,9 @@ def get_diarization_pipeline():
     if _diar_pipeline is not None:
         return _diar_pipeline
     if not DIARIZATION_AVAILABLE:
-        raise gr.Error("pyannote.audio не установлен (см. секцию 0). Перезапустите ноутбук.")
+        raise gr.Error("pyannote.audio недоступен в этой сессии (причина — в логе при "
+                       "запуске ноутбука). Разметка спикеров отключена, транскрибация "
+                       "и остальные функции работают.")
     if not hf_token:
         raise gr.Error("Для определения спикеров нужен HF_TOKEN в Kaggle Secrets "
                        "(Add-ons → Secrets → HF_TOKEN).")
@@ -347,6 +613,7 @@ def sec_to_time(seconds):
 
 def download_youtube(url, progress=None):
     """Скачивание с защитой от обрывов связи. Возвращает (путь, название)."""
+    # Чистим остатки прошлых загрузок, чтобы не подхватить чужой файл
     for f in glob.glob(f"{WORK_DIR}/yt_audio.*"):
         try: os.remove(f)
         except OSError: pass
@@ -356,10 +623,11 @@ def download_youtube(url, progress=None):
         "outtmpl": f"{WORK_DIR}/yt_audio.%(ext)s",
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav"}],
         "noplaylist": True,
+        # --- устойчивость к обрывам ---
         "retries": 10,
         "fragment_retries": 10,
-        "continuedl": True,
-        "http_chunk_size": 10_000_000,
+        "continuedl": True,                # докачка частично скачанного файла
+        "http_chunk_size": 10_000_000,     # кусками по 10 МБ — лечит троттлинг YouTube
         "socket_timeout": 30,
         "concurrent_fragment_downloads": 4,
     }
@@ -394,7 +662,8 @@ def get_audio_duration(path):
 
 
 def _asr(audio_path, lang):
-    """Вызов Whisper с языком или без."""
+    """Вызов Whisper с языком или без. generate_kwargs=None в этой
+    версии transformers падает, поэтому передаём его только когда язык задан."""
     kwargs = {"return_timestamps": True}
     if lang:
         kwargs["generate_kwargs"] = {"language": lang}
@@ -428,6 +697,7 @@ def transcribe_with_progress(audio_path, lang, progress, piece_sec=600):
         )
         result = _asr(piece_path, lang)
 
+        # сдвигаем таймкоды куска к абсолютному времени видео
         for seg in result.get("chunks") or []:
             ts = seg.get("timestamp") or (None, None)
             s = (ts[0] if ts[0] is not None else 0.0) + start
@@ -457,7 +727,7 @@ def build_paragraphs(segments, pause=1.2, max_chars=MAX_PARAGRAPH_CHARS):
             continue
         if start is None:
             start = prev_end if prev_end is not None else 0.0
-        spk = seg.get("speaker")  # НОВОЕ
+        spk = seg.get("speaker")
         if cur_text:
             gap = start - (prev_end if prev_end is not None else start)
             ends_sentence = cur_text.rstrip()[-1:] in ".!?…"
@@ -513,7 +783,7 @@ def list_input_files():
     if os.path.isdir(WORK_DIR):
         for fn in sorted(os.listdir(WORK_DIR)):
             if fn.startswith("_asr_piece_") or fn.startswith("_diar_tmp"):
-                continue
+                continue  # технические файлы
             if os.path.splitext(fn)[1].lower() in INPUT_AUDIO_EXTS:
                 p = os.path.join(WORK_DIR, fn)
                 found.append(("💾 " + fn + " (working)", p))
@@ -627,6 +897,10 @@ def process_media(input_type, file_path, youtube_url, input_file_choice,
     if not audio_path or not os.path.exists(audio_path):
         raise gr.Error("Загрузите файл или укажите ссылку.")
 
+    if diar_enabled and not DIARIZATION_AVAILABLE:
+        raise gr.Error("Спикеры недоступны в этой сессии — причина в логе при запуске "
+                       "ноутбука. Снимите галочку «Размечать реплики…» и запустите снова.")
+
     transcript, prompt_text, txt_path, _ = _transcribe_one(
         audio_path, title, lang_choice, with_timestamps, with_paragraphs,
         pause_sec, diar_enabled, diar_n_choice, make_prompt, instruction, progress)
@@ -640,7 +914,7 @@ def process_batch(batch_urls, batch_files, batch_input_selected,
                   diar_enabled, diar_n_choice, prompts_in_zip,
                   progress=gr.Progress()):
     """
-    НОВОЕ: пакетная обработка (генератор — лог обновляется после каждого файла).
+    Пакетная обработка (генератор — лог обновляется после каждого файла).
     Источники: ссылки YouTube + загруженные файлы + файлы из Input/working.
     Каждый текст — отдельный .txt; в конце собираем ZIP.
     """
@@ -665,6 +939,11 @@ def process_batch(batch_urls, batch_files, batch_input_selected,
 
     log = [f"Всего источников: {len(sources)}. Поехали!"]
     yield "\n".join(log), None
+
+    if diar_enabled and not DIARIZATION_AVAILABLE:
+        diar_enabled = False
+        log.append("⚠️ Спикеры недоступны в этой сессии — пакет обрабатывается без разметки реплик.")
+        yield "\n".join(log), None
 
     # если включена диаризация — грузим пайплайн один раз, заранее
     if diar_enabled:
@@ -783,7 +1062,9 @@ with gr.Blocks() as app:
                         cb_diar = gr.Checkbox(
                             value=False,
                             label="Размечать реплики: «Спикер 1: …», «Спикер 2: …»",
-                            info="Нужен HF_TOKEN и одноразовое согласие с условиями моделей pyannote (см. комментарий в коде, секция 3.5)")
+                            info="Нужен HF_TOKEN и одноразовое согласие с условиями моделей pyannote "
+                                 "(huggingface.co/pyannote/speaker-diarization-3.1 и …/segmentation-3.0). "
+                                 "Если в логе запуска написано «Спикеры недоступны» — галочка просто не сработает")
                         diar_n = gr.Dropdown(NUM_SPEAKERS_CHOICES, value="Авто",
                                              label="Сколько спикеров в видео",
                                              info="«Авто» — определить автоматически; если знаете точное число — укажите, будет точнее")
