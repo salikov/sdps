@@ -1,292 +1,25 @@
 #!pip install -q -U yt-dlp
 #!pip install -q transformers accelerate gradio
-#!pip install -q pyannote.audio
-#  ⬆ эти строки оставлены для справки: в этой версии всё ставится кодом
-#  секции 0 — с защитой окружения и без необходимости рестартов.
 # =======================
 
 # ================================================================
-#  0. Установка библиотек + защита окружения (без рестартов)
+#  0. Установка: библиотеки + JS-runtime (deno) для yt-dlp
 # ================================================================
-# Правило одно: ВСЕ pip-команды выполняются ДО первого импорта тяжёлых
-# библиотек (numpy/torch/transformers/gradio импортирует секция 1).
-# В свежей сессии ядро ещё ничего не загрузило в память, поэтому менять
-# пакеты на диске безопасно. Главное свойство ноутбука:
-#     открыл → запустил → работаешь в интерфейсе, рестарты не нужны.
-#
-# Зачем нужна «защита»: установка pyannote.audio «в лоб» подтягивает
-# свежий numpy 2.x, а torch/scipy/transformers в образе Kaggle собраны
-# под numpy 1.x. В итоге на диске оказываются перемешанные файлы numpy,
-# и первый же импорт падает с ошибкой вида
-#     ImportError: cannot import name '_center' from 'numpy._core.umath'
-# Поэтому здесь:
-#   1) «замки» версий: pip не имеет права трогать numpy/torch/scipy/…;
-#   2) pyannote.audio==3.1.1 первым — дружит с numpy 1.x и совпадает
-#      с моделью pyannote/speaker-diarization-3.1;
-#   3) автопроверка/автопочинка numpy/scipy ДО импортов;
-#   4) контрольный импорт всего стека в ОТДЕЛЬНОМ процессе: видно
-#      реальное состояние диска, ядро не трогаем. Если pyannote
-#      конфликтует — он честно отключается, остальное работает.
-import os
-import re
-import sys
-import shutil
-import zipfile
-import subprocess
-import importlib.util
-import importlib.metadata
 
-# --- deno: JS-runtime для yt-dlp (как раньше) ---
+# deno ставим напрямую с GitHub — официальный install.sh теперь
+# задаёт интерактивный вопрос про PATH и виснет в Kaggle (нет stdin).
+# Бинарник кладём в /usr/local/bin — этот путь уже есть в PATH.
+import os
 os.system("curl -fsSL -o /tmp/deno.zip https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip")
+
+
+import zipfile
 with zipfile.ZipFile("/tmp/deno.zip") as z:
     z.extractall("/usr/local/bin")
 os.chmod("/usr/local/bin/deno", 0o755)
+
 os.system("deno --version")
-
-NUMPY_PRELOADED = "numpy" in sys.modules  # ядро успело загрузить numpy раньше нас?
-
-
-def _pip(*args, timeout=1800):
-    """pip того же интерпретатора, что и ядро. Возвращает код возврата."""
-    try:
-        return subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-q", *args],
-            timeout=timeout).returncode
-    except subprocess.TimeoutExpired:
-        return 1
-
-
-def _ver(pkg):
-    """Версия пакета на диске (по метаданным; сам пакет не импортируем)."""
-    try:
-        return importlib.metadata.version(pkg)
-    except importlib.metadata.PackageNotFoundError:
-        return None
-
-
-def _check_stack(with_torch=False, with_pyannote=False, verbose=False):
-    """
-    Проверка numpy/scipy (+ torch/transformers/gradio/pyannote)
-    В ОТДЕЛЬНОМ ПРОЦЕССЕ: ядро ничего не импортирует, а проверка видит
-    реальное состояние файлов на диске.
-    """
-    code = "import numpy, numpy.char, numpy.linalg, numpy.fft"
-    if _ver("scipy"):
-        code += ", scipy.optimize"
-    if with_torch:
-        code += ", torch, transformers, gradio"
-    if with_pyannote and _ver("pyannote.audio"):
-        code += "; from pyannote.audio import Pipeline"
-    try:
-        r = subprocess.run([sys.executable, "-c", code],
-                           capture_output=True, timeout=600)
-    except Exception:
-        return False
-    if r.returncode == 0:
-        return True
-    if verbose:
-        lines = (r.stderr or b"").decode(errors="ignore").strip().splitlines()
-        print("   причина:", lines[-1][:250] if lines else f"код {r.returncode}")
-    return False
-
-
-def _site_packages():
-    """Каталог site-packages (сам numpy при этом не импортируем)."""
-    try:
-        spec = importlib.util.find_spec("numpy")
-        if spec and spec.origin:
-            return os.path.dirname(os.path.dirname(spec.origin))
-    except Exception:
-        pass
-    import sysconfig
-    return sysconfig.get_paths()["purelib"]
-
-
-def _nuke_pkg(pkg):
-    """
-    Полное удаление пакета с диска: pip uninstall + зачистка остатков
-    вручную (pip сам не умеет убирать «перемешанные» файлы чужих версий).
-    """
-    subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", pkg],
-                   capture_output=True, timeout=300)
-    sp = _site_packages()
-    if not (sp and os.path.isdir(sp)):
-        return
-    for entry in os.listdir(sp):
-        is_dist_info = entry.startswith(pkg + "-") and entry.endswith(".dist-info")
-        if entry == pkg or is_dist_info or entry in (pkg + ".libs", pkg + ".pth"):
-            target = os.path.join(sp, entry)
-            if os.path.isdir(target):
-                shutil.rmtree(target, ignore_errors=True)
-            else:
-                try:
-                    os.remove(target)
-                except OSError:
-                    pass
-
-
-def _numpy_req_from_scipy():
-    """Требование к numpy из метаданных scipy (например 'numpy<1.28,>=1.21.6')."""
-    try:
-        for r in importlib.metadata.requires("scipy") or []:
-            r = (r or "").split(";")[0].strip()
-            if r.startswith("numpy") and re.search(r"[<>=]", r):
-                return r
-    except Exception:
-        pass
-    return None
-
-
-def _repair_numpy():
-    """
-    Чиним numpy, если на диске перемешаны файлы разных версий.
-    Кандидаты: текущая версия по метаданным → версия, разрешённая scipy → 1.26.4.
-    """
-    reqs = []
-    if _ver("numpy"):
-        reqs.append(f"numpy=={_ver('numpy')}")
-    _nr = _numpy_req_from_scipy()
-    if _nr:
-        reqs.append(_nr)
-    reqs.append("numpy==1.26.4")
-
-    for req in reqs:
-        _nuke_pkg("numpy")
-        if _pip("--no-deps", req) == 0 and _check_stack():
-            print(f"✅ numpy переустановлен ({req}).")
-            return True
-    return False
-
-
-def _ensure_stack():
-    """Быстрая проверка numpy/scipy; при поломке — автопочинка."""
-    if _check_stack():
-        return True
-    print("⚠️ numpy/scipy на диске повреждены (перемешались файлы разных версий) — чиним…")
-    _check_stack(verbose=True)
-    if _repair_numpy():
-        return True
-    v = _ver("scipy")
-    if v:  # numpy в порядке, но битый scipy — переустанавливаем его
-        _nuke_pkg("scipy")
-        if _pip("--no-deps", f"scipy=={v}") == 0 and _check_stack():
-            print("✅ scipy переустановлен.")
-            return True
-    raise RuntimeError(
-        "Автопочинка numpy/scipy не удалась. Выполните в отдельной ячейке:\n"
-        "    !pip install --force-reinstall --no-deps numpy==1.26.4 scipy\n"
-        "и запустите ноутбук снова (Run → Run All)."
-    )
-
-
-# --- шаг 1: базовое здоровье numpy/scipy ---
-_ensure_stack()
-
-# --- шаг 2: если в образе нет какой-то базовой библиотеки — ставим ---
-_LOCK_PKGS = ("numpy", "scipy", "torch", "torchaudio", "transformers",
-              "huggingface_hub", "pandas")
-_locks = [f"{p}=={_ver(p)}" for p in _LOCK_PKGS if _ver(p)]
-for _mod, _pkgs in (("numpy", ("numpy==1.26.4",)),
-                    ("scipy", ("scipy",)),
-                    ("transformers", ("transformers", "accelerate")),
-                    ("gradio", ("gradio",)),
-                    ("torch", ("torch", "torchaudio")),
-                    ("yt_dlp", ("yt-dlp",))):
-    try:
-        _missing = importlib.util.find_spec(_mod) is None
-    except Exception:
-        _missing = False
-    if _missing:
-        print(f"В образе нет {_pkgs[0]} — устанавливаем…")
-        _pip(*_pkgs, *_locks)
-
-# свежий yt-dlp — меньше шансов, что YouTube «сменил замки»
-_pip("-U", "yt-dlp")
-
-# --- шаг 3: снимок версий и замки для установки pyannote ---
-_SNAPSHOT = {p: _ver(p) for p in _LOCK_PKGS}
-_locks = [f"{p}=={v}" for p, v in _SNAPSHOT.items() if v]
-_core_locks = [f"{p}=={_SNAPSHOT[p]}" for p in ("numpy", "torch") if _SNAPSHOT[p]]
-if _SNAPSHOT["torch"] and not _SNAPSHOT["torchaudio"]:
-    # torchaudio в образе нет, а pyannote его просит: ставим ровно под наш torch
-    _ta = f"torchaudio=={_SNAPSHOT['torch'].split('+')[0]}"
-    _core_locks.append(_ta)
-    _locks.append(_ta)
-
-# --- шаг 4: pyannote.audio (разметка спикеров) ---
-# Сначала 3.1.1 — проверенно дружит с numpy 1.x и совпадает с моделью
-# pyannote/speaker-diarization-3.1. «Замки» не дают pip обновить numpy/torch.
-PYANNOTE_OK = False
-for _spec, _lk in (("pyannote.audio==3.1.1", _locks),
-                   ("pyannote.audio==3.1.1", _core_locks),
-                   ("pyannote.audio", _core_locks)):
-    if _pip(_spec, *_lk) == 0:
-        PYANNOTE_OK = True
-        print(f"✅ {_spec} установлен — режим «Спикеры» доступен")
-        break
-    print(f"ℹ️ {_spec} при текущих версиях не встал — пробуем другой вариант…")
-
-if not PYANNOTE_OK:
-    print("⚠️ pyannote.audio установить не удалось: разметка спикеров в этой сессии "
-          "отключена. Транскрибация, таймкоды, абзацы и пакетная обработка — как обычно.")
-
-# --- шаг 5: контрольный импорт всего стека в отдельном процессе ---
-print("Контрольный импорт numpy+scipy+torch+transformers+gradio"
-      + ("+pyannote" if PYANNOTE_OK else "") + "…")
-if not _check_stack(with_torch=True, with_pyannote=PYANNOTE_OK):
-    print("⚠️ Что-то не импортируется — разбираемся:")
-    _check_stack(with_torch=True, with_pyannote=PYANNOTE_OK, verbose=True)
-
-    # 5а) pip что-то сместил? откатываем к снимку
-    _changed = [f"{p}=={_SNAPSHOT[p]}" for p in _SNAPSHOT
-                if _SNAPSHOT[p] and _ver(p) != _SNAPSHOT[p]]
-    if _changed:
-        print("Откатываем сместившиеся пакеты:", ", ".join(_changed))
-        _pip("--no-deps", *_changed)
-
-    # 5б) numpy несовместим с scipy из образа (например, поставился 2.x) —
-    #     ставим ту версию, которую разрешает сам scipy
-    if not _check_stack(with_torch=True):
-        _nr = _numpy_req_from_scipy()
-        if _nr and _pip("--no-deps", _nr) == 0:
-            print(f"Совместимый numpy: {_nr}.")
-
-    # 5в) всё ещё плохо? жертвуем спикерами ради работоспособности
-    if not _check_stack(with_torch=True) and PYANNOTE_OK:
-        print("⚠️ pyannote.audio конфликтует с окружением — отключаем «Спикеров», "
-              "транскрибация не пострадает.")
-        subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "pyannote.audio"],
-                       capture_output=True, timeout=300)
-        PYANNOTE_OK = False
-
-    # 5г) последний рубеж — полная переустановка numpy/scipy
-    if not _check_stack(with_torch=True):
-        _ensure_stack()
-
-    if not _check_stack(with_torch=True):
-        raise RuntimeError(
-            "Окружение не поднялось даже после автопочинки. Выполните в отдельной "
-            "ячейке:\n    !pip install --force-reinstall --no-deps numpy==1.26.4 scipy\n"
-            "затем Run → Run All."
-        )
-
-# pyannote отдельно: база в порядке, а он нет — отключаем только его
-if PYANNOTE_OK and not _check_stack(with_torch=True, with_pyannote=True):
-    print("⚠️ pyannote.audio установлен, но не импортируется — «Спикеры» отключены, "
-          "остальное работает.")
-    PYANNOTE_OK = False
-
-# если это ядро УЖЕ грузило numpy, а мы вынужденно поменяли его версию на
-# диске — без одного рестарта в памяти останется старая копия
-if NUMPY_PRELOADED and _ver("numpy") != _SNAPSHOT.get("numpy"):
-    raise RuntimeError(
-        "Версия numpy на диске изменилась, а это ядро уже загрузило numpy в память.\n"
-        "👉 Run → Restart Session и запустите ещё раз. Это единственный рестарт: "
-        "в свежих сессиях установка идёт до импортов, и до этого не доходит."
-    )
-
-print("УСПЕШНО: Библиотеки и deno установлены!"
-      + (" Спикеры доступны." if PYANNOTE_OK else " Спикеры в этой сессии недоступны."))
+print("УСПЕШНО: Библиотеки и deno установлены!")
 
 # ================================================================
 #  1. Импорты и настройки
@@ -296,27 +29,26 @@ import torch
 import os
 import re
 import glob
+import gc              # 🆕 очистка памяти между файлами пакета
 import time
 import yt_dlp
 import subprocess
 import math
+import zipfile         # 🆕 для архива (дублируем на случай разбиения на ячейки)
 from transformers import pipeline
-
-# pyannote импортируем только если секция 0 его успешно поставила и проверила
-DIARIZATION_AVAILABLE = False
-if PYANNOTE_OK:
-    try:
-        from pyannote.audio import Pipeline as PyannotePipeline
-        DIARIZATION_AVAILABLE = True
-    except Exception as _pyannote_err:
-        print(f"⚠️ pyannote.audio не импортируется ({_pyannote_err}) — "
-              "разметка спикеров недоступна, остальное работает.")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Используем устройство: {device}")
 
 WORK_DIR = "/kaggle/working" if os.path.exists("/kaggle/working") else "/content"
 MAX_PARAGRAPH_CHARS = 900  # максимальная длина одного абзаца (символов)
+
+# 🆕 Папка, куда складываются тексты пакетной обработки
+TRANSCRIPTS_DIR = os.path.join(WORK_DIR, "transcripts")
+os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
+
+# 🆕 ошибка «не хватило видеопамяти» (перехватываем её, не прерывая очередь)
+OOMError = getattr(torch.cuda, "OutOfMemoryError", RuntimeError)
 
 # ================================================================
 #  2. Токен Hugging Face из Kaggle Secrets (если задан)
@@ -336,6 +68,7 @@ else:
 # ================================================================
 #  3. Whisper Large v3 Turbo + кеш в личном Kaggle-датасете
 # ================================================================
+# (без изменений)
 import json
 import shutil
 import importlib.util
@@ -438,10 +171,13 @@ def resolve_model_source():
         print(f"🎉 Создан кеш-датасет: https://www.kaggle.com/datasets/{dataset_id}")
         print("   Чтобы модель загружалась мгновенно, один раз подключите его:")
         print(f"   Add Input → Your Work + Datasets → {DATASET_SLUG} → Restart Session.")
+        print("   А без подключения следующие сессии просто скачают модель с Kaggle —")
+        print("   это быстрее HF и не зависит от токена и лимитов Hugging Face.")
     elif "already exist" in (out3 or "").lower():
         print("Датасет-кеш уже существует (видимо, создан только что) — используем локальную копию.")
     else:
         print(f"⚠️ Не удалось создать датасет-кеш: {out3[:300]}")
+        print("   Не страшно: модель уже скачана локально, работаем как обычно.")
 
     return LOCAL_MODEL_DIR
 
@@ -486,117 +222,7 @@ DEFAULT_AI_PROMPT = """Ты — профессиональный редакто�
 ### 🎯 Выводы
 (главный итог, к чему пришёл спикер)
 
-Если в тексте есть таймкоды вида [MM:SS] — проставляй их у важных мыслей, чтобы можно было перейти к моменту в видео.
-Если транскрипция размечена по спикерам («Спикер 1», «Спикер 2», …) — в идеях и выводах указывай, кто именно говорил."""
-
-# ================================================================
-#  3.5. Диаризация спикеров (pyannote.audio)
-# ================================================================
-# Модели pyannote «gated»: чтобы они скачались, нужно ОДИН раз
-# залогиниться на Hugging Face (под аккаунтом вашего HF_TOKEN)
-# и нажать «Agree» на ОБЕИХ страницах:
-#   * https://huggingface.co/pyannote/speaker-diarization-3.1
-#   * https://huggingface.co/pyannote/segmentation-3.0
-# Пайплайн грузится лениво — только если включили галочку «Спикеры».
-
-_diar_pipeline = None
-
-
-def get_diarization_pipeline():
-    global _diar_pipeline
-    if _diar_pipeline is not None:
-        return _diar_pipeline
-    if not DIARIZATION_AVAILABLE:
-        raise gr.Error("pyannote.audio недоступен в этой сессии (причина — в логе при "
-                       "запуске ноутбука). Разметка спикеров отключена, транскрибация "
-                       "и остальные функции работают.")
-    if not hf_token:
-        raise gr.Error("Для определения спикеров нужен HF_TOKEN в Kaggle Secrets "
-                       "(Add-ons → Secrets → HF_TOKEN).")
-    print("Загрузка пайплайна диаризации pyannote/speaker-diarization-3.1...")
-    try:
-        pipe = PyannotePipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1", use_auth_token=hf_token)
-    except Exception as e:
-        raise gr.Error("Не удалось скачать модель pyannote. Проверьте, что на HF-аккаунте "
-                       "приняты условия ОБЕИХ моделей: pyannote/speaker-diarization-3.1 и "
-                       f"pyannote/segmentation-3.0. Подробности: {e}")
-    if device == "cuda":
-        pipe.to(torch.device("cuda"))
-    _diar_pipeline = pipe
-    print("Пайплайн диаризации загружен!")
-    return _diar_pipeline
-
-
-def parse_num_speakers(choice):
-    """«Авто» или пусто -> None (pyannote определит сам), иначе число."""
-    try:
-        n = int(str(choice))
-        return n if n >= 1 else None
-    except (TypeError, ValueError):
-        return None
-
-
-def run_diarization(audio_path, num_speakers=None):
-    """Диаризация всего файла. Возвращает список (start, end, метка_спикера)."""
-    pipe = get_diarization_pipeline()
-    # pyannote надёжнее всего читает wav; mp4/m4a/… сначала конвертируем
-    tmp_wav = None
-    if os.path.splitext(audio_path)[1].lower() != ".wav":
-        tmp_wav = os.path.join(WORK_DIR, "_diar_tmp.wav")
-        r = subprocess.run(["ffmpeg", "-y", "-i", audio_path,
-                            "-ar", "16000", "-ac", "1", tmp_wav], capture_output=True)
-        if r.returncode != 0 or not os.path.exists(tmp_wav):
-            raise gr.Error("ffmpeg не смог подготовить аудио для диаризации.")
-        audio_for_diar = tmp_wav
-    else:
-        audio_for_diar = audio_path
-    try:
-        kwargs = {"num_speakers": num_speakers} if num_speakers else {}
-        diar = pipe(audio_for_diar, **kwargs)
-        return [(t.start, t.end, spk) for t, _, spk in diar.itertracks(yield_label=True)]
-    finally:
-        if tmp_wav:
-            try: os.remove(tmp_wav)
-            except OSError: pass
-
-
-def assign_speakers(segments, turns):
-    """
-    Приклеиваем метки спикеров к сегментам Whisper: сегмент получает метку того,
-    кто говорил дольше всего внутри его таймкода.
-    Возвращает (segments, число_спикеров). Если спикер один — метки не ставим.
-    """
-    if not turns:
-        return segments, 1
-
-    # SPEAKER_00 -> «Спикер 1» (по порядку первого появления в записи)
-    order, norm = {}, []
-    for s, e, spk in turns:
-        if spk not in order:
-            order[spk] = f"Спикер {len(order) + 1}"
-        norm.append((s, e, order[spk]))
-    norm.sort(key=lambda t: t[0])
-
-    if len(order) < 2:
-        return segments, len(order)
-
-    def speaker_for(start, end):
-        best, best_ov = None, 0.0
-        for ts, te, spk in norm:
-            if ts >= end:
-                break  # реплики отсортированы по началу — дальше только позже
-            ov = min(end, te) - max(start, ts)
-            if ov > best_ov:
-                best, best_ov = spk, ov
-        return best
-
-    for seg in segments:
-        ts = seg.get("timestamp") or (None, None)
-        s = ts[0] if ts[0] is not None else 0.0
-        e = ts[1] if ts[1] is not None else s + 5.0
-        seg["speaker"] = speaker_for(s, e)
-    return segments, len(order)
+Если в тексте есть таймкоды вида [MM:SS] — проставляй их у важных мыслей, чтобы можно было перейти к моменту в видео."""
 
 # ================================================================
 #  4. Вспомогательные функции
@@ -647,7 +273,6 @@ def download_youtube(url, progress=None):
             time.sleep(3)
     raise gr.Error(f"YouTube не отдал файл за 3 попытки. Последняя ошибка: {last_err}")
 
-
 def get_audio_duration(path):
     """Длительность аудио в секундах через ffprobe."""
     try:
@@ -660,7 +285,6 @@ def get_audio_duration(path):
     except Exception:
         return None
 
-
 def _asr(audio_path, lang):
     """Вызов Whisper с языком или без. generate_kwargs=None в этой
     версии transformers падает, поэтому передаём его только когда язык задан."""
@@ -669,11 +293,10 @@ def _asr(audio_path, lang):
         kwargs["generate_kwargs"] = {"language": lang}
     return asr_pipeline(audio_path, **kwargs)
 
-
 def transcribe_with_progress(audio_path, lang, progress, piece_sec=600):
     """
     Длинное аудио транскрибируем кусками по piece_sec секунд,
-    короткое (< 20 мин) — одним вызовом.
+    обновляя прогресс после каждого куска. Короткое (< 20 мин) — одним вызовом.
     Возвращает сегменты с абсолютными таймкодами.
     """
     duration = get_audio_duration(audio_path)
@@ -696,7 +319,7 @@ def transcribe_with_progress(audio_path, lang, progress, piece_sec=600):
             capture_output=True,
         )
         result = _asr(piece_path, lang)
-
+        
         # сдвигаем таймкоды куска к абсолютному времени видео
         for seg in result.get("chunks") or []:
             ts = seg.get("timestamp") or (None, None)
@@ -709,16 +332,15 @@ def transcribe_with_progress(audio_path, lang, progress, piece_sec=600):
             pass
     return all_segments
 
-
 def build_paragraphs(segments, pause=1.2, max_chars=MAX_PARAGRAPH_CHARS):
     """
     Склеиваем короткие сегменты Whisper в абзацы.
-    Новый абзац — если пауза длиннее `pause` секунд, СМЕНИЛСЯ СПИКЕР,
+    Новый абзац — если пауза в речи длиннее `pause` секунд,
     либо абзац дорос до max_chars и закончился на конец предложения.
-    Возвращает список (время_начала, спикер|None, текст).
+    Возвращает список (время_начала, текст).
     """
     paragraphs = []
-    cur_text, cur_start, prev_end, cur_spk = "", None, None, None
+    cur_text, cur_start, prev_end = "", None, None
     for seg in segments:
         ts = seg.get("timestamp") or (None, None)
         start, end = ts[0], ts[1]
@@ -727,31 +349,25 @@ def build_paragraphs(segments, pause=1.2, max_chars=MAX_PARAGRAPH_CHARS):
             continue
         if start is None:
             start = prev_end if prev_end is not None else 0.0
-        spk = seg.get("speaker")
         if cur_text:
             gap = start - (prev_end if prev_end is not None else start)
             ends_sentence = cur_text.rstrip()[-1:] in ".!?…"
-            speaker_changed = (spk is not None and cur_spk is not None and spk != cur_spk)
-            if gap > pause or (len(cur_text) > max_chars and ends_sentence) or speaker_changed:
-                paragraphs.append((cur_start, cur_spk, cur_text))
-                cur_text, cur_start, cur_spk = "", None, None
+            if gap > pause or (len(cur_text) > max_chars and ends_sentence):
+                paragraphs.append((cur_start, cur_text))
+                cur_text, cur_start = "", None
         if not cur_text:
             cur_start = start
-            cur_spk = spk
         cur_text = f"{cur_text} {text}".strip()
         prev_end = end if end is not None else start
     if cur_text:
-        paragraphs.append((cur_start, cur_spk, cur_text))
+        paragraphs.append((cur_start, cur_text))
     return paragraphs
 
 
 def format_transcript(paragraphs, with_timestamps, with_paragraphs):
-    """Абзацы -> итоговый текст: [MM:SS] Спикер N: текст"""
     parts = []
-    for start, spk, text in paragraphs:
+    for start, text in paragraphs:
         prefix = f"[{sec_to_time(start)}] " if with_timestamps else ""
-        if spk:
-            prefix += f"{spk}: "
         parts.append(prefix + text)
     sep = "\n\n" if with_paragraphs else " "
     return sep.join(parts).strip()
@@ -764,11 +380,12 @@ INPUT_AUDIO_EXTS = {
     ".mp4", ".mkv", ".webm", ".mov", ".avi", ".mpg", ".mpeg",
 }
 
-
 def list_input_files():
     """
-    Ищем аудио/видео файлы в /kaggle/input (рекурсивно)
-    и в WORK_DIR. Возвращает список пар (метка, полный путь).
+    Ищем аудио/видео файлы:
+      * в /kaggle/input — датасеты, подключённые к ноутбуку (рекурсивно);
+      * в WORK_DIR — например, yt_audio.wav, скачанный с YouTube ранее.
+    Возвращает список пар (метка, полный путь) для мультивыбора.
     """
     found = []
 
@@ -782,381 +399,293 @@ def list_input_files():
 
     if os.path.isdir(WORK_DIR):
         for fn in sorted(os.listdir(WORK_DIR)):
-            if fn.startswith("_asr_piece_") or fn.startswith("_diar_tmp"):
-                continue  # технические файлы
+            if fn.startswith("_asr_piece_"):
+                continue  # технические куски от прошлой транскрибации
             if os.path.splitext(fn)[1].lower() in INPUT_AUDIO_EXTS:
                 p = os.path.join(WORK_DIR, fn)
                 found.append(("💾 " + fn + " (working)", p))
 
     return found
 
+
 # ================================================================
-#  5. Основной пайплайн
+#  5. Пакетный пайплайн: очередь из нескольких источников
 # ================================================================
-class _SubProgress:
-    """Прогресс одного файла внутри пакета: маппит 0..1 в свой диапазон общего прогресса."""
-    def __init__(self, parent, lo, hi):
-        self._p, self._lo, self._hi = parent, lo, hi
-
-    def __call__(self, frac, desc=None):
-        try:
-            self._p(self._lo + (self._hi - self._lo) * float(frac), desc=desc)
-        except Exception:
-            pass  # проблемы прогресса не должны ронять обработку
-
-
-def safe_filename(title):
-    safe = re.sub(r"[^\w\-\s]", "", title or "").strip()[:60]
-    return safe or "transcript"
-
-
-def unique_path(path):
-    """Не перезаписывать существующие файлы: добавляем _2, _3, ..."""
-    if not os.path.exists(path):
-        return path
-    base, ext = os.path.splitext(path)
-    i = 2
-    while os.path.exists(f"{base}_{i}{ext}"):
-        i += 1
-    return f"{base}_{i}{ext}"
-
-
-def _transcribe_one(audio_path, title, lang_choice, with_timestamps, with_paragraphs,
-                    pause_sec, diar_enabled, diar_n_choice, make_prompt, instruction,
-                    progress):
-    """
-    Весь путь для одного аудио: Whisper -> (диаризация) -> абзацы -> .txt-файл.
-    Возвращает (текст, промпт, путь_к_txt, число_спикеров).
-    `progress` — любой callable(fraction, desc=...): gr.Progress или _SubProgress.
-    """
-    lang = LANG_MAP.get(lang_choice)
-
-    try:
-        segments = transcribe_with_progress(audio_path, lang, progress)
-    except torch.cuda.OutOfMemoryError:
-        raise gr.Error("Не хватило видеопамяти. Уменьшите batch_size в коде (например, до 4).")
-
-    if not segments:
-        raise gr.Error("Whisper не распознал речь (возможно, в аудио только музыка или тишина).")
-
-    # --- диаризация ---
-    n_speakers = 1
-    if diar_enabled:
-        progress(0.75, desc="Определяем спикеров (pyannote)...")
-        try:
-            turns = run_diarization(audio_path, parse_num_speakers(diar_n_choice))
-        except gr.Error:
-            raise
-        except Exception as e:
-            raise gr.Error(f"Диаризация не удалась: {e}. Попробуйте без разметки спикеров.")
-        segments, n_speakers = assign_speakers(segments, turns)
-
-    # --- форматирование ---
-    progress(0.85, desc="Форматируем текст...")
-    paragraphs = build_paragraphs(segments, pause=pause_sec)
-    transcript = format_transcript(paragraphs, with_timestamps, with_paragraphs)
-
-    # --- готовый промпт для внешней большой модели ---
-    prompt_text = ""
-    if make_prompt:
-        instr = (instruction or "").strip() or DEFAULT_AI_PROMPT
-        head = f"Транскрипция видео: «{title}»\n\n" if title else ""
-        prompt_text = f"{instr}\n\n---\n\n{head}{transcript}"
-
-    # --- сохраняем в файл ---
-    txt_path = unique_path(os.path.join(WORK_DIR, f"{safe_filename(title)}.txt"))
-    with open(txt_path, "w", encoding="utf-8") as f:
-        f.write(transcript)
-
-    return transcript, prompt_text, txt_path, n_speakers
-
-
-def process_media(input_type, file_path, youtube_url, input_file_choice,
-                  lang_choice, with_timestamps, with_paragraphs, pause_sec,
-                  diar_enabled, diar_n_choice, make_prompt, instruction,
-                  progress=gr.Progress()):
-
-    # --- получаем аудио ---
-    title = None
+def collect_tasks(input_type, file_paths, youtube_urls, input_choices):
+    """Собираем очередь задач: список пар (тип, источник)."""
+    tasks = []
     if input_type == "YouTube":
-        if not (youtube_url and youtube_url.strip()):
-            raise gr.Error("Укажите ссылку на YouTube или выберите другой источник.")
-        audio_path, title = download_youtube(youtube_url.strip(), progress)
+        for line in (youtube_urls or "").splitlines():
+            u = line.strip()
+            if u:
+                tasks.append(("youtube", u))
     elif input_type == "Из загрузок (Input)":
-        if not input_file_choice:
-            raise gr.Error("Выберите файл в списке (или нажмите «Обновить список»).")
-        if not os.path.exists(input_file_choice):
-            raise gr.Error("Файл не найден — возможно, сессия перезапускалась. Нажмите «Обновить список».")
-        audio_path = input_file_choice
-        title = os.path.splitext(os.path.basename(input_file_choice))[0]
-    else:
-        audio_path = file_path
-        if file_path:
-            title = os.path.splitext(os.path.basename(file_path))[0]
-
-    if not audio_path or not os.path.exists(audio_path):
-        raise gr.Error("Загрузите файл или укажите ссылку.")
-
-    if diar_enabled and not DIARIZATION_AVAILABLE:
-        raise gr.Error("Спикеры недоступны в этой сессии — причина в логе при запуске "
-                       "ноутбука. Снимите галочку «Размечать реплики…» и запустите снова.")
-
-    transcript, prompt_text, txt_path, _ = _transcribe_one(
-        audio_path, title, lang_choice, with_timestamps, with_paragraphs,
-        pause_sec, diar_enabled, diar_n_choice, make_prompt, instruction, progress)
-
-    progress(1.0, desc="Готово!")
-    return transcript, prompt_text, txt_path
+        if isinstance(input_choices, str):
+            input_choices = [input_choices]
+        for path in (input_choices or []):
+            tasks.append(("path", path))
+    else:  # "Файлы"
+        if isinstance(file_paths, str):
+            file_paths = [file_paths]
+        for path in (file_paths or []):
+            tasks.append(("path", path))
+    return tasks
 
 
-def process_batch(batch_urls, batch_files, batch_input_selected,
+def unique_txt_path(title):
+    """Путь для нового .txt с безопасным уникальным именем (без перезаписи)."""
+    safe = re.sub(r"[^\w\-\s]", "", title or "transcript").strip()[:60].strip() or "transcript"
+    path = os.path.join(TRANSCRIPTS_DIR, f"{safe}.txt")
+    i = 2
+    while os.path.exists(path):
+        path = os.path.join(TRANSCRIPTS_DIR, f"{safe}_{i}.txt")
+        i += 1
+    return path
+
+
+def load_result(txt_path):
+    """Загружаем сохранённые транскрипцию и промпт по пути .txt-файла."""
+    transcript, prompt = "", ""
+    if txt_path and os.path.isfile(txt_path):
+        with open(txt_path, encoding="utf-8") as f:
+            transcript = f.read()
+        prompt_path = os.path.splitext(txt_path)[0] + "_prompt.txt"
+        if os.path.isfile(prompt_path):
+            with open(prompt_path, encoding="utf-8") as f:
+                prompt = f.read()
+    return transcript, prompt
+
+
+def build_zip():
+    """Архив из всех .txt папки транскрипций (сами тексты + промпты)."""
+    files = sorted(glob.glob(os.path.join(TRANSCRIPTS_DIR, "*.txt")))
+    if not files:
+        return None
+    zip_path = os.path.join(WORK_DIR, "transcripts.zip")
+    if os.path.exists(zip_path):
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for f in files:
+            z.write(f, arcname=os.path.basename(f))
+    return zip_path
+
+
+def process_batch(input_type, file_paths, youtube_urls, input_choices,
                   lang_choice, with_timestamps, with_paragraphs, pause_sec,
-                  diar_enabled, diar_n_choice, prompts_in_zip,
-                  progress=gr.Progress()):
+                  make_prompt, instruction, progress=gr.Progress()):
     """
-    Пакетная обработка (генератор — лог обновляется после каждого файла).
-    Источники: ссылки YouTube + загруженные файлы + файлы из Input/working.
-    Каждый текст — отдельный .txt; в конце собираем ZIP.
+    Обрабатывает ОЧЕРЕДЬ файлов/ссылок по одному:
+    скачивание → транскрибация → форматирование → сохранение в отдельный .txt.
+    Ошибка на одном файле не останавливает остальные.
     """
-    sources = []  # (тип, значение, метка для лога)
-    for line in (batch_urls or "").splitlines():
-        line = line.strip()
-        if line:
-            sources.append(("url", line, line))
-    for p in (batch_files or []):
-        p = str(p)
-        if os.path.exists(p):
-            sources.append(("file", p, os.path.basename(p)))
-    for p in (batch_input_selected or []):
-        p = str(p)
-        if os.path.exists(p):
-            sources.append(("file", p, os.path.basename(p)))
-        else:
-            sources.append(("missing", p, os.path.basename(p)))
+    tasks = collect_tasks(input_type, file_paths, youtube_urls, input_choices)
+    if not tasks:
+        raise gr.Error("Не выбрано ни одного файла и не указано ни одной ссылки.")
 
-    if not sources:
-        raise gr.Error("Нечего обрабатывать: добавьте ссылки, файлы или выберите из списка.")
+    lang = LANG_MAP.get(lang_choice)
+    n = len(tasks)
+    rows = []      # строки таблицы результатов
+    choices = []   # варианты для просмотра в дропдауне
+    ok_count = 0
 
-    log = [f"Всего источников: {len(sources)}. Поехали!"]
-    yield "\n".join(log), None
+    for idx, (kind, src) in enumerate(tasks):
+        # локальный прогресс файла -> общий прогресс очереди
+        def p(frac, desc="", _idx=idx, _n=n):
+            frac = min(max(frac, 0.0), 1.0)
+            progress((_idx + frac) / _n, desc=f"Файл {_idx + 1}/{_n}: {desc}")
 
-    if diar_enabled and not DIARIZATION_AVAILABLE:
-        diar_enabled = False
-        log.append("⚠️ Спикеры недоступны в этой сессии — пакет обрабатывается без разметки реплик.")
-        yield "\n".join(log), None
-
-    # если включена диаризация — грузим пайплайн один раз, заранее
-    if diar_enabled:
-        try:
-            get_diarization_pipeline()
-        except gr.Error as e:
-            diar_enabled = False
-            log.append(f"⚠️ Диаризация отключена для всего пакета: {getattr(e, 'message', None) or str(e)}")
-            yield "\n".join(log), None
-
-    txt_paths, prompt_paths, ok_count = [], [], 0
-    total = len(sources)
-
-    for i, (kind, value, label) in enumerate(sources):
-        sub = _SubProgress(progress, i / total, (i + 0.95) / total)
-        log.append("")
-        log.append(f"▶️ [{i + 1}/{total}] {label}")
-        yield "\n".join(log), None
-
-        if kind == "missing":
-            log.append(f"❌ Файл не найден (сессия перезапускалась?): {value}")
-            yield "\n".join(log), None
-            continue
+        # предварительное имя — чтобы ошибки тоже попали в таблицу с понятной подписью
+        title = (f"YouTube #{idx + 1}" if kind == "youtube"
+                 else os.path.splitext(os.path.basename(src))[0])
 
         try:
-            # 1) добываем аудио
-            if kind == "url":
-                audio_path, title = download_youtube(value, sub)
+            # --- 1. получаем аудио ---
+            if kind == "youtube":
+                p(0.02, f"скачиваем: {src[:60]}…")
+                audio_path, title = download_youtube(src, p)
             else:
-                audio_path, title = value, os.path.splitext(os.path.basename(value))[0]
+                if not src or not os.path.exists(src):
+                    raise gr.Error(f"файл не найден: {src}")
+                audio_path = src
 
-            # 2) транскрибируем (+диаризация, если включена)
-            transcript, prompt_text, txt_path, n_speakers = _transcribe_one(
-                audio_path, title, lang_choice, with_timestamps, with_paragraphs,
-                pause_sec, diar_enabled, diar_n_choice, prompts_in_zip, None, sub)
-            txt_paths.append(txt_path)
+            # --- 2. транскрибация ---
+            p(0.2, f"«{title[:50]}»: транскрибация (самое долгое)…")
+            segments = transcribe_with_progress(audio_path, lang, p)
+            if not segments:
+                raise gr.Error("Whisper не распознал речь (возможно, только музыка или тишина).")
 
-            # 3) промпт отдельным файлом (если просили)
-            if prompts_in_zip and prompt_text:
-                p_path = unique_path(os.path.join(WORK_DIR, f"{safe_filename(title)}__prompt.txt"))
-                with open(p_path, "w", encoding="utf-8") as f:
+            # --- 3. форматирование ---
+            p(0.9, f"«{title[:50]}»: форматируем текст…")
+            paragraphs = build_paragraphs(segments, pause=pause_sec)
+            transcript = format_transcript(paragraphs, with_timestamps, with_paragraphs)
+
+            # --- 4. промпт для внешней большой модели ---
+            prompt_text = ""
+            if make_prompt:
+                instr = (instruction or "").strip() or DEFAULT_AI_PROMPT
+                head = f"Транскрипция видео: «{title}»\n\n" if title else ""
+                prompt_text = f"{instr}\n\n---\n\n{head}{transcript}"
+
+            # --- 5. сохраняем в ОТДЕЛЬНЫЙ файл ---
+            txt_path = unique_txt_path(title)
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(transcript)
+            if prompt_text:
+                prompt_path = os.path.splitext(txt_path)[0] + "_prompt.txt"
+                with open(prompt_path, "w", encoding="utf-8") as f:
                     f.write(prompt_text)
-                prompt_paths.append(p_path)
 
-            spk = f", спикеров: {n_speakers}" if diar_enabled else ""
-            log.append(f"✅ «{title}» — {len(transcript)} симв.{spk} → {os.path.basename(txt_path)}")
+            rows.append([str(idx + 1), title, "✅ готово", os.path.basename(txt_path)])
+            choices.append((title, txt_path))
             ok_count += 1
-        except torch.cuda.OutOfMemoryError:
-            log.append("❌ Не хватило видеопамяти — файл пропущен (уменьшите batch_size в коде).")
-        except gr.Error as e:
-            log.append(f"❌ {getattr(e, 'message', None) or str(e)}")
+
+            # --- 6. чистим память перед следующим файлом очереди ---
+            del segments, paragraphs
+            gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
+
+        except OOMError:
+            if device == "cuda":
+                torch.cuda.empty_cache()
+            rows.append([str(idx + 1), title,
+                         "❌ не хватило видеопамяти — уменьшите batch_size в коде", ""])
         except Exception as e:
-            log.append(f"❌ Непредвиденная ошибка ({type(e).__name__}): {e}")
-        yield "\n".join(log), None
+            msg = getattr(e, "message", None) or str(e) or type(e).__name__
+            rows.append([str(idx + 1), title, f"❌ {msg[:300]}", ""])
 
-    # --- архив ---
-    zip_path = None
-    if txt_paths:
-        stamp = time.strftime("%Y%m%d_%H%M")
-        zip_path = os.path.join(WORK_DIR, f"transcripts_{stamp}.zip")
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for p in txt_paths:
-                zf.write(p, arcname=os.path.basename(p))
-            for p in prompt_paths:
-                zf.write(p, arcname=os.path.basename(p))
-            zf.writestr("_batch_log.txt", "\n".join(log))
-        log.append("")
-        log.append(f"🗜 Готово: {ok_count} из {total}. Архив: {os.path.basename(zip_path)} — "
-                   "жмите кнопку скачивания ниже.")
-    else:
-        log.append("")
-        log.append("⚠️ Ни один файл не обработан — архив не собираем.")
+    err_count = n - ok_count
+    status = f"**Готово: {ok_count} из {n}.**" + \
+             (f" Не обработано: {err_count} — детали в таблице." if err_count else "")
+    progress(1.0, desc="Готово!")
 
-    progress(1.0, desc="Пакет завершён!")
-    yield "\n".join(log), zip_path
+    # --- вывод: таблица, просмотр, файлы, архив ---
+    first_txt = choices[0][1] if choices else None
+    transcript_text, prompt_text = load_result(first_txt)
+
+    transcripts_all = sorted(
+        f for f in glob.glob(os.path.join(TRANSCRIPTS_DIR, "*.txt"))
+        if not f.endswith("_prompt.txt"))
+    dd_choices = [(os.path.splitext(os.path.basename(f))[0], f) for f in transcripts_all]
+
+    all_txt = sorted(glob.glob(os.path.join(TRANSCRIPTS_DIR, "*.txt")))
+    zip_path = build_zip() if choices else None
+
+    return (rows, status,
+            gr.update(choices=dd_choices, value=first_txt),
+            transcript_text, prompt_text,
+            all_txt, zip_path)
+
 
 # ================================================================
 #  6. Интерфейс Gradio
 # ================================================================
-NUM_SPEAKERS_CHOICES = ["Авто"] + [str(i) for i in range(1, 11)]
-
 with gr.Blocks() as app:
-    gr.Markdown("# 🎬 Видео/Аудио → Текст (таймкоды, абзацы, спикеры, пакет)")
-    gr.Markdown("Транскрибация идёт локально через Whisper. Саммари делаете в большой модели: "
-                "скопируйте готовый промпт из второй вкладки и вставьте в ChatGPT / Claude / Gemini.")
+    gr.Markdown("# 🎬 Видео/Аудио → Текст — пакетная обработка")
+    gr.Markdown(
+        "Транскрибация идёт локально через Whisper. Можно закинуть сразу несколько файлов, "
+        "несколько ссылок на YouTube или выбрать несколько файлов из Input — они обработаются "
+        "по очереди, каждый текст сохранится в отдельный .txt, всё скачивается одним архивом. "
+        "Саммари делаете в большой модели: скопируйте готовый промпт из второй вкладки.")
 
-    with gr.Tabs():
-        # ==================== Вкладка 1: один файл ====================
-        with gr.Tab("🎬 Один файл"):
-            with gr.Row():
-                with gr.Column():
-                    input_type = gr.Radio(
-                        ["Файл", "YouTube", "Из загрузок (Input)"],
-                        label="Откуда берём аудио?", value="YouTube")
-                    file_input = gr.Audio(label="Загрузите аудио/видео файл", type="filepath", visible=False)
-                    url_input = gr.Textbox(label="Ссылка на YouTube",
-                                           value="https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-                    input_file_dd = gr.Dropdown(
-                        choices=list_input_files(),
-                        label="Выбрать из загруженных",
-                        info="Файлы из /kaggle/input (подключённые датасеты) и ранее скачанные в /kaggle/working",
-                        visible=False,
-                    )
-                    btn_refresh = gr.Button("🔄 Обновить список файлов")
-                    lang_selector = gr.Dropdown(list(LANG_MAP.keys()), value="Автоопределение",
-                                                label="Язык видео (явное указание повышает точность)")
+    with gr.Row():
+        with gr.Column():
+            input_type = gr.Radio(
+                ["Файлы", "YouTube", "Из загрузок (Input)"],
+                label="Откуда берём аудио?", value="YouTube")
+            file_input = gr.File(
+                label="Загрузите файлы (аудио/видео, можно несколько)",
+                file_count="multiple",
+                file_types=sorted(INPUT_AUDIO_EXTS),
+                visible=False)
+            url_input = gr.Textbox(
+                label="Ссылки на YouTube — по одной в строке",
+                info="Сколько непустых строк — столько видео в очереди",
+                lines=4,
+                value="https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+            input_files_group = gr.CheckboxGroup(
+                choices=list_input_files(),
+                label="Выбрать из загруженных (можно несколько)",
+                info="Файлы из /kaggle/input (подключённые датасеты) и ранее скачанные в /kaggle/working",
+                visible=False)
+            refresh_btn = gr.Button("🔄 Обновить список файлов", visible=False)
 
-                    with gr.Accordion("⚙️ Опции текста", open=True):
-                        cb_timestamps = gr.Checkbox(value=False, label="⏱ Таймкоды [MM:SS] в начале абзацев")
-                        cb_paragraphs = gr.Checkbox(value=True, label="¶ Разбивать на абзацы (по паузам в речи)")
-                        pause_slider = gr.Slider(0.4, 3.0, value=1.2, step=0.1,
-                                                 label="Пауза для нового абзаца, сек",
-                                                 info="Насколько длинную тишину считать границей абзаца")
+            lang_selector = gr.Dropdown(list(LANG_MAP.keys()), value="Автоопределение",
+                                        label="Язык видео (явное указание повышает точность)")
 
-                    with gr.Accordion("👥 Спикеры (кто говорит)", open=False):
-                        cb_diar = gr.Checkbox(
-                            value=False,
-                            label="Размечать реплики: «Спикер 1: …», «Спикер 2: …»",
-                            info="Нужен HF_TOKEN и одноразовое согласие с условиями моделей pyannote "
-                                 "(huggingface.co/pyannote/speaker-diarization-3.1 и …/segmentation-3.0). "
-                                 "Если в логе запуска написано «Спикеры недоступны» — галочка просто не сработает")
-                        diar_n = gr.Dropdown(NUM_SPEAKERS_CHOICES, value="Авто",
-                                             label="Сколько спикеров в видео",
-                                             info="«Авто» — определить автоматически; если знаете точное число — укажите, будет точнее")
+            with gr.Accordion("⚙️ Опции текста", open=True):
+                cb_timestamps = gr.Checkbox(value=False, label="⏱ Таймкоды [MM:SS] в начале абзацев")
+                cb_paragraphs = gr.Checkbox(value=True, label="¶ Разбивать на абзацы (по паузам в речи)")
+                pause_slider = gr.Slider(0.4, 3.0, value=1.2, step=0.1,
+                                         label="Пауза для нового абзаца, сек",
+                                         info="Насколько длинную тишину считать границей абзаца")
 
-                    with gr.Accordion("🤖 Промпт для внешней ИИ (ChatGPT / Claude / Gemini)", open=False):
-                        cb_prompt = gr.Checkbox(value=True, label="Собрать готовый промпт (инструкция + транскрипция)")
-                        prompt_instruction = gr.Textbox(
-                            label="Инструкция для ИИ (можно отредактировать перед запуском)",
-                            lines=10, value=DEFAULT_AI_PROMPT)
+            with gr.Accordion("🤖 Промпт для внешней ИИ (ChatGPT / Claude / Gemini)", open=False):
+                cb_prompt = gr.Checkbox(value=True, label="Собрать готовый промпт (инструкция + транскрипция)")
+                prompt_instruction = gr.Textbox(
+                    label="Инструкция для ИИ (можно отредактировать перед запуском)",
+                    lines=10, value=DEFAULT_AI_PROMPT)
 
-                    process_btn = gr.Button("🚀 Получить текст", variant="primary")
+            process_btn = gr.Button("🚀 Обработать очередь", variant="primary")
 
-                with gr.Column():
-                    with gr.Tabs():
-                        with gr.Tab("📜 Транскрипция"):
-                            transcript_out = gr.Textbox(label="Текст", lines=18,
-                                                        interactive=False, show_copy_button=True)
-                        with gr.Tab("🤖 Промпт для большой модели"):
-                            prompt_out = gr.Textbox(label="Скопируйте целиком и вставьте в веб-версию ИИ",
-                                                    lines=18, interactive=False, show_copy_button=True)
-                    file_out = gr.File(label="Скачать транскрипцию (.txt)")
+        with gr.Column():
+            results_table = gr.Dataframe(
+                headers=["№", "Название", "Статус", "Файл"],
+                datatype=["str", "str", "str", "str"],
+                interactive=False, wrap=True,
+                label="Результаты обработки")
+            status_out = gr.Markdown("Очередь пуста — выберите файлы или вставьте ссылки.")
 
-        # ==================== Вкладка 2: пакет ====================
-        with gr.Tab("📦 Пакетная обработка"):
-            with gr.Row():
-                with gr.Column():
-                    gr.Markdown("Укажите любые комбинации источников — обработаются по очереди. "
-                                "Каждая транскрипция сохранится отдельным .txt, в конце — общий ZIP.")
-                    batch_urls = gr.Textbox(
-                        label="🔗 Ссылки на YouTube (по одной в строке)", lines=4,
-                        placeholder="https://www.youtube.com/watch?v=...\nhttps://youtu.be/...")
-                    batch_files = gr.File(label="💾 Или загрузите несколько файлов",
-                                          file_count="multiple")
-                    batch_input = gr.CheckboxGroup(
-                        choices=list_input_files(),
-                        label="📘 Или выберите из Input (датасеты) и /kaggle/working")
-                    btn_refresh_batch = gr.Button("🔄 Обновить списки файлов")
-                    batch_lang = gr.Dropdown(list(LANG_MAP.keys()), value="Автоопределение",
-                                             label="Язык видео")
+            with gr.Tabs():
+                with gr.Tab("📜 Транскрипция"):
+                    result_dd = gr.Dropdown(
+                        choices=[], label="📂 Готовые транскрипции — выберите для просмотра")
+                    transcript_out = gr.Textbox(label="Текст", lines=18,
+                                                interactive=False, show_copy_button=True)
+                with gr.Tab("🤖 Промпт для большой модели"):
+                    prompt_out = gr.Textbox(label="Скопируйте целиком и вставьте в веб-версию ИИ",
+                                            lines=18, interactive=False, show_copy_button=True)
 
-                    with gr.Accordion("⚙️ Опции текста", open=True):
-                        cb_timestamps_b = gr.Checkbox(value=False, label="⏱ Таймкоды [MM:SS] в начале абзацев")
-                        cb_paragraphs_b = gr.Checkbox(value=True, label="¶ Разбивать на абзацы")
-                        pause_slider_b = gr.Slider(0.4, 3.0, value=1.2, step=0.1,
-                                                   label="Пауза для нового абзаца, сек")
-
-                    with gr.Accordion("👥 Спикеры", open=False):
-                        cb_diar_b = gr.Checkbox(value=False, label="Размечать реплики спикеров")
-                        diar_n_b = gr.Dropdown(NUM_SPEAKERS_CHOICES, value="Авто",
-                                               label="Сколько спикеров в видео")
-
-                    cb_prompt_zip = gr.Checkbox(
-                        value=False,
-                        label="🤖 Добавить в архив готовые промпты (по файлу на видео)")
-
-                    run_batch_btn = gr.Button("🚀 Запустить пакет", variant="primary")
-
-                with gr.Column():
-                    batch_log = gr.Textbox(label="Лог обработки", lines=20, interactive=False)
-                    batch_zip = gr.File(label="📥 Скачать всё архивом (.zip)")
+            files_out = gr.File(
+                label="Скачать по отдельности (.txt — транскрипции и промпты)",
+                file_count="multiple")
+            zip_btn = gr.Button("📦 Скачать архивом", variant="secondary")
+            zip_out = gr.File(label="Архив всех транскрипций (.zip)")
 
     def toggle_inputs(choice):
-        show_file = choice == "Файл"
+        show_file = choice == "Файлы"
         show_url = choice == "YouTube"
         show_dd = choice == "Из загрузок (Input)"
         return (gr.update(visible=show_file), gr.update(visible=show_url),
-                gr.update(visible=show_dd))
+                gr.update(visible=show_dd), gr.update(visible=show_dd))
     input_type.change(toggle_inputs, inputs=[input_type],
-                      outputs=[file_input, url_input, input_file_dd])
+                      outputs=[file_input, url_input, input_files_group, refresh_btn])
 
-    def refresh_lists():
-        choices = list_input_files()
-        return gr.update(choices=choices), gr.update(choices=choices)
-    btn_refresh.click(refresh_lists, outputs=[input_file_dd, batch_input])
-    btn_refresh_batch.click(refresh_lists, outputs=[input_file_dd, batch_input])
+    def refresh_files():
+        return gr.update(choices=list_input_files())
+    refresh_btn.click(refresh_files, outputs=[input_files_group])
+
+    result_dd.change(load_result, inputs=[result_dd],
+                     outputs=[transcript_out, prompt_out])
 
     process_btn.click(
-        fn=process_media,
-        inputs=[input_type, file_input, url_input, input_file_dd, lang_selector,
+        fn=process_batch,
+        inputs=[input_type, file_input, url_input, input_files_group, lang_selector,
                 cb_timestamps, cb_paragraphs, pause_slider,
-                cb_diar, diar_n,
                 cb_prompt, prompt_instruction],
-        outputs=[transcript_out, prompt_out, file_out],
+        outputs=[results_table, status_out, result_dd,
+                 transcript_out, prompt_out, files_out, zip_out],
     )
 
-    run_batch_btn.click(
-        fn=process_batch,
-        inputs=[batch_urls, batch_files, batch_input, batch_lang,
-                cb_timestamps_b, cb_paragraphs_b, pause_slider_b,
-                cb_diar_b, diar_n_b, cb_prompt_zip],
-        outputs=[batch_log, batch_zip],
-    )
+    def on_zip_click():
+        zip_path = build_zip()
+        if not zip_path:
+            raise gr.Error("Нет сохранённых транскрипций — сначала обработайте файлы.")
+        return zip_path
+    zip_btn.click(on_zip_click, outputs=[zip_out])
 
 app.launch(share=True, debug=True)
 
