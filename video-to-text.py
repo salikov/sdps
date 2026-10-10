@@ -29,12 +29,12 @@ import torch
 import os
 import re
 import glob
-import gc              # 🆕 очистка памяти между файлами пакета
+import gc              # очистка памяти между файлами пакета
 import time
 import yt_dlp
 import subprocess
 import math
-import zipfile         # 🆕 для архива (дублируем на случай разбиения на ячейки)
+import zipfile
 from transformers import pipeline
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -43,11 +43,11 @@ print(f"Используем устройство: {device}")
 WORK_DIR = "/kaggle/working" if os.path.exists("/kaggle/working") else "/content"
 MAX_PARAGRAPH_CHARS = 900  # максимальная длина одного абзаца (символов)
 
-# 🆕 Папка, куда складываются тексты пакетной обработки
+# Папка, куда складываются тексты пакетной обработки
 TRANSCRIPTS_DIR = os.path.join(WORK_DIR, "transcripts")
 os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
 
-# 🆕 ошибка «не хватило видеопамяти» (перехватываем её, не прерывая очередь)
+# ошибка «не хватило видеопамяти» (перехватываем её, не прерывая очередь)
 OOMError = getattr(torch.cuda, "OutOfMemoryError", RuntimeError)
 
 # ================================================================
@@ -66,128 +66,18 @@ else:
     print("HF_TOKEN не найден — качаем без токена (медленнее, возможны лимиты).")
 
 # ================================================================
-#  3. Whisper Large v3 Turbo + кеш в личном Kaggle-датасете
+#  3. Whisper Large v3 Turbo — просто качаем с Hugging Face
 # ================================================================
-# (без изменений)
-import json
-import shutil
-import importlib.util
-from huggingface_hub import snapshot_download
-
+# Кеш-датасет whisper-cache больше не используется: монтирование Input
+# при старте сессии медленнее, чем скачать модель с HF напрямую.
+# Повторные запуски этой ячейки в той же сессии не качают модель заново:
+# huggingface_hub сам кеширует файлы в ~/.cache/huggingface.
 HF_MODEL_ID = "openai/whisper-large-v3-turbo"
-DATASET_SLUG = "whisper-cache"                    # имя кеш-датасета
-DATASET_DIR = f"/kaggle/input/{DATASET_SLUG}"     # путь, если подключён как Input
-LOCAL_MODEL_DIR = os.path.join(WORK_DIR, "whisper_model")
 
-
-def _run_kaggle(*args, timeout=1800):
-    """Kaggle CLI через подпроцесс. Возвращает (успех, текст вывода)."""
-    try:
-        r = subprocess.run(["kaggle"] + list(args),
-                           capture_output=True, text=True, timeout=timeout)
-        return r.returncode == 0, (r.stdout or "") + (r.stderr or "")
-    except FileNotFoundError:
-        return False, "kaggle CLI не найден"
-    except subprocess.TimeoutExpired:
-        return False, "таймаут команды kaggle"
-
-
-def _get_kaggle_username():
-    """Секрет KAGGLE_API (содержимое kaggle.json) -> username или None."""
-    if importlib.util.find_spec("kaggle") is None:
-        return None  # kaggle CLI не установлен (не Kaggle-среда)
-    try:
-        from kaggle_secrets import UserSecretsClient
-        raw = UserSecretsClient().get_secret("KAGGLE_API")
-    except Exception:
-        return None  # секрета нет или он не прикреплён к ноутбуку
-    if not raw or not raw.strip():
-        return None
-    try:
-        creds = json.loads(raw.strip())
-        username, key = creds["username"], creds["key"]
-    except Exception:
-        print("⚠️ Секрет KAGGLE_API заполнен, но это не содержимое kaggle.json — игнорируем.")
-        return None
-    # кладём kaggle.json туда, где его ждёт CLI
-    kdir = os.path.join(os.path.expanduser("~"), ".kaggle")
-    os.makedirs(kdir, exist_ok=True)
-    kjson = os.path.join(kdir, "kaggle.json")
-    with open(kjson, "w") as f:
-        json.dump({"username": username, "key": key}, f)
-    os.chmod(kjson, 0o600)
-    return username
-
-
-def resolve_model_source():
-    """
-    Возвращает путь к папке с файлами модели или None
-    (None = грузить с Hugging Face по имени, как раньше).
-    """
-    # 1) датасет подключён как Input
-    if os.path.isfile(os.path.join(DATASET_DIR, "config.json")):
-        print(f"✅ Модель берём из подключённого Input: {DATASET_DIR} (без скачивания)")
-        return DATASET_DIR
-
-    # 2) уже скачана в этой сессии (например, перезапуск ячейки)
-    if os.path.isfile(os.path.join(LOCAL_MODEL_DIR, "config.json")):
-        print(f"✅ Модель уже в локальной папке: {LOCAL_MODEL_DIR}")
-        return LOCAL_MODEL_DIR
-
-    # 3) есть ли API-ключ Kaggle
-    username = _get_kaggle_username()
-    if not username:
-        print("KAGGLE_API не задан (или не прикреплён) — модель качается с Hugging Face, как раньше.")
-        return None
-
-    dataset_id = f"{username}/{DATASET_SLUG}"
-
-    # 3а) датасет уже существует — качаем модель из него
-    ok, _ = _run_kaggle("datasets", "files", dataset_id, timeout=60)
-    if ok:
-        print(f"📦 Датасет {dataset_id} найден — скачиваем модель из него (мимо Hugging Face)...")
-        os.makedirs(LOCAL_MODEL_DIR, exist_ok=True)
-        ok2, out2 = _run_kaggle("datasets", "download", dataset_id,
-                                "-p", LOCAL_MODEL_DIR, "--unzip")
-        if ok2 and os.path.isfile(os.path.join(LOCAL_MODEL_DIR, "config.json")):
-            print("✅ Модель скачана из Kaggle-датасета.")
-            return LOCAL_MODEL_DIR
-        print(f"⚠️ Скачать датасет не вышло: {out2[:200]} — качаем с Hugging Face.")
-        shutil.rmtree(LOCAL_MODEL_DIR, ignore_errors=True)
-        return None
-
-    # 3б) датасета нет: качаем модель с HF и создаём кеш-датасет
-    print("Кеш-датасета ещё нет — скачиваем модель с Hugging Face (один раз)...")
-    os.makedirs(LOCAL_MODEL_DIR, exist_ok=True)
-    snapshot_download(repo_id=HF_MODEL_ID, local_dir=LOCAL_MODEL_DIR, token=hf_token)
-    shutil.rmtree(os.path.join(LOCAL_MODEL_DIR, ".cache"), ignore_errors=True)
-
-    with open(os.path.join(LOCAL_MODEL_DIR, "dataset-metadata.json"), "w") as f:
-        json.dump({"title": DATASET_SLUG, "id": dataset_id,
-                   "licenses": [{"name": "CC0-1.0"}]}, f, indent=2)
-
-    ok3, out3 = _run_kaggle("datasets", "create", "-p", LOCAL_MODEL_DIR, timeout=3600)
-    if ok3:
-        print(f"🎉 Создан кеш-датасет: https://www.kaggle.com/datasets/{dataset_id}")
-        print("   Чтобы модель загружалась мгновенно, один раз подключите его:")
-        print(f"   Add Input → Your Work + Datasets → {DATASET_SLUG} → Restart Session.")
-        print("   А без подключения следующие сессии просто скачают модель с Kaggle —")
-        print("   это быстрее HF и не зависит от токена и лимитов Hugging Face.")
-    elif "already exist" in (out3 or "").lower():
-        print("Датасет-кеш уже существует (видимо, создан только что) — используем локальную копию.")
-    else:
-        print(f"⚠️ Не удалось создать датасет-кеш: {out3[:300]}")
-        print("   Не страшно: модель уже скачана локально, работаем как обычно.")
-
-    return LOCAL_MODEL_DIR
-
-
-model_dir = resolve_model_source()
-
-print("Загрузка Whisper Large v3 Turbo...")
+print("Загрузка Whisper Large v3 Turbo с Hugging Face...")
 asr_pipeline = pipeline(
     "automatic-speech-recognition",
-    model=model_dir if model_dir else HF_MODEL_ID,
+    model=HF_MODEL_ID,
     device=device,
     chunk_length_s=30,
     batch_size=8,  # при OutOfMemory уменьшите до 4
