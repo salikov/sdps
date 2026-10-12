@@ -599,4 +599,4 @@ while True:
     time.sleep(3600)
 
 if os.path.exists("photo.py"):
-    os.remove("vtt.py")
+    os.remove("photo.py")
