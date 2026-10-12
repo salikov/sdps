@@ -1,5 +1,41 @@
-# !pip install -q -U transformers diffusers accelerate gradio
+# ============================================================
+# ФИКС СОВМЕСТИМОСТИ diffusers ↔ torchao
+# (обязателен ДО импорта diffusers!)
+# В свежих образах Kaggle предустановленный diffusers при импорте пытается
+# сделать `from torchao.quantization import FqnToConfig`, а предустановленный
+# torchao слишком старый — импорт diffusers падает. torchao нам не нужен,
+# поэтому удаляем его, и diffusers импортируется штатно.
+# ============================================================
+import importlib, importlib.util, subprocess, sys
 
+def _torchao_conflicts():
+    if importlib.util.find_spec("torchao") is None:
+        return False                      # torchao нет — конфликта нет
+    try:
+        from torchao.quantization import FqnToConfig  # noqa: F401
+        return False                      # torchao свежий — всё в порядке
+    except Exception:
+        return True                       # torchao старый — diffusers упадёт
+
+if _torchao_conflicts():
+    print("🔧 Конфликт diffusers ↔ torchao: удаляю устаревший torchao...")
+    subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "-q", "torchao"],
+                   capture_output=True, text=True)
+    for m in [k for k in list(sys.modules) if k == "torchao" or k.startswith("torchao.")]:
+        sys.modules.pop(m, None)
+    importlib.invalidate_caches()
+    print("✅ torchao удалён")
+else:
+    print("✅ torchao не мешает — фикс не требуется")
+
+# Если diffusers уже успел импортироваться в сессии с ошибкой — сбрасываем кэш
+stale = [k for k in list(sys.modules) if k == "diffusers" or k.startswith("diffusers.")]
+if stale:
+    for m in stale:
+        sys.modules.pop(m, None)
+    importlib.invalidate_caches()
+
+# ================== ОБЫЧНЫЕ ИМПОРТЫ ==================
 import warnings, logging, os, gc, traceback, time
 import torch, gradio as gr
 import numpy as np
